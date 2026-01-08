@@ -536,6 +536,23 @@ def main():
         league_filter = st.selectbox("League Filter", ["All Leagues", "Domestic Leagues", "Scottish Leagues"], index=1)
         min_minutes = st.slider("Minimum Minutes Played", 0, 3500, 900, 100)
         age_range = st.slider("Age Range", 16, 40, (18, 30))
+        
+        # Recruitment mode - exclude Scottish Premiership from scouting
+        recruitment_mode = st.checkbox("🎯 Recruitment mode: exclude Scottish Premiership players", value=False,
+                                       help="Excludes competition_id 51 from scouting shortlist (training still uses SPFL)")
+        
+        # Season filter for scouting pool
+        st.caption("Season filter (scouting only):")
+        if "merged" in st.session_state and st.session_state.merged is not None:
+            available_seasons = sorted(st.session_state.merged["season_name"].dropna().unique().tolist())
+            if available_seasons:
+                season_filter = st.multiselect("Scouting season(s)", available_seasons, default=available_seasons,
+                                              help="Filter scouting pool by season (training unaffected)")
+            else:
+                season_filter = None
+        else:
+            season_filter = None
+            st.caption("Load data to enable season filter")
 
         st.divider()
         st.header("3) Model Settings")
@@ -546,10 +563,20 @@ def main():
         sample_frac = st.slider("Bootstrap sample fraction", 0.50, 1.00, 0.85, 0.05)
 
         top_k = st.slider("Show Top-K predictors", 3, 20, 5, 1)
+        
+        st.divider()
+        st.header("4) Output Settings")
+        finishing_factor = st.slider("Finishing factor (for pred_goals_90)", 0.7, 1.3, 1.0, 0.01,
+                                    help="Predicted goals p90 = pred_np_xg_90 × finishing_factor")
+        sort_by = st.selectbox("Sort shortlist by", ["pred_goals_90", "pred_np_xg_90", "residual"], index=0)
 
         st.divider()
         load_btn = st.button("Load / Refresh Data", type="primary")
 
+    # Check if model settings changed (requires refit)
+    model_settings_key = f"{include_team_controls}_{add_age_poly}_{n_boot}_{sample_frac}"
+    model_settings_changed = st.session_state.get("model_settings_key") != model_settings_key
+    
     # Persist data in session state
     if load_btn or ("player_raw" not in st.session_state):
         if not sb_user or not sb_pass:
@@ -568,6 +595,10 @@ def main():
 
         st.session_state.player_raw = player_raw
         st.session_state.team_raw = team_raw
+        # Clear cached model results when data refreshed
+        st.session_state.pop("merged", None)
+        st.session_state.pop("full_model", None)
+        st.session_state.pop("trait_rows", None)
 
         st.success("Data loaded.")
 
@@ -577,10 +608,14 @@ def main():
         st.warning("No data loaded yet.")
         return
 
-    # Process + join
-    player_df = process_player_data(player_raw)
-    team_df = process_team_data(team_raw)
-    merged = join_player_team(player_df, team_df)
+    # Process + join (cache in session state)
+    if "merged" not in st.session_state or st.session_state.merged is None:
+        player_df = process_player_data(player_raw)
+        team_df = process_team_data(team_raw)
+        merged = join_player_team(player_df, team_df)
+        st.session_state.merged = merged
+    else:
+        merged = st.session_state.merged
 
     # -----------------------------
     # TRAINING SET: SPFL-only STs >=900 mins
@@ -616,41 +651,69 @@ def main():
     # Fit model + stability
     # -----------------------------
     st.subheader("Model: Elastic Net + Stability Selection")
-    try:
-        X, y, player_feats, team_feats = build_feature_matrix(
-            train_base,
-            target=PRIMARY_TARGET,
-            include_team_controls=include_team_controls,
-            add_age_poly=add_age_poly,
-        )
-    except Exception as e:
-        st.error(f"Feature matrix build failed: {e}")
-        return
+    
+    # Only refit if model settings changed or no cached model
+    if model_settings_changed or "full_model" not in st.session_state:
+        try:
+            X, y, player_feats, team_feats = build_feature_matrix(
+                train_base,
+                target=PRIMARY_TARGET,
+                include_team_controls=include_team_controls,
+                add_age_poly=add_age_poly,
+            )
+        except Exception as e:
+            st.error(f"Feature matrix build failed: {e}")
+            return
 
-    if len(X) < 25:
-        st.error("Training set too small after filters. Consider adding more SPFL seasons or lowering minutes threshold.")
-        return
+        if len(X) < 25:
+            st.error("Training set too small after filters. Consider adding more SPFL seasons or lowering minutes threshold.")
+            return
 
-    all_features = list(X.columns)
+        all_features = list(X.columns)
 
-    with st.spinner("Fitting ElasticNetCV on full training set..."):
-        full_model = fit_elastic_net_cv(X, y, random_state=42)
+        with st.spinner("Fitting ElasticNetCV on full training set..."):
+            full_model = fit_elastic_net_cv(X, y, random_state=42)
 
+        with st.spinner("Running stability selection (bootstraps)..."):
+            stab = stability_selection(
+                X=X,
+                y=y,
+                feature_names=all_features,
+                n_boot=n_boot,
+                sample_frac=float(sample_frac),
+                random_state=42,
+            )
+
+        # Separate "player traits" from "team controls" for interpretation
+        trait_rows = stab[stab["feature"].isin(player_feats)].copy()
+        control_rows = stab[stab["feature"].isin(team_feats)].copy()
+        
+        # Cache everything
+        st.session_state.full_model = full_model
+        st.session_state.X_train = X
+        st.session_state.y_train = y
+        st.session_state.all_features = all_features
+        st.session_state.player_feats = player_feats
+        st.session_state.team_feats = team_feats
+        st.session_state.trait_rows = trait_rows
+        st.session_state.control_rows = control_rows
+        st.session_state.model_settings_key = model_settings_key
+    else:
+        # Use cached model
+        full_model = st.session_state.full_model
+        X = st.session_state.X_train
+        y = st.session_state.y_train
+        all_features = st.session_state.all_features
+        player_feats = st.session_state.player_feats
+        team_feats = st.session_state.team_feats
+        trait_rows = st.session_state.trait_rows
+        control_rows = st.session_state.control_rows
+    
     enet = full_model.named_steps["enet"]
     st.caption(
         f"Chosen alpha={enet.alpha_:.6f} | l1_ratio={enet.l1_ratio_} | "
         f"Non-zero coefs={int(np.sum(enet.coef_ != 0))}/{len(all_features)}"
     )
-
-    with st.spinner("Running stability selection (bootstraps)..."):
-        stab = stability_selection(
-            X=X,
-            y=y,
-            feature_names=all_features,
-            n_boot=n_boot,
-            sample_frac=float(sample_frac),
-            random_state=42,
-        )
 
     # Separate “player traits” from “team controls” for interpretation
     trait_rows = stab[stab["feature"].isin(player_feats)].copy()
@@ -711,7 +774,7 @@ def main():
     st.divider()
 
     # -----------------------------
-    # SCOUTING POOL: apply user filters (age + league)
+    # SCOUTING POOL: apply user filters (age + league + recruitment mode + season)
     # -----------------------------
     st.subheader("Scouting Shortlist (filters applied)")
 
@@ -721,9 +784,21 @@ def main():
         age_range=age_range,
         league_filter=league_filter,
     )
+    
+    # Apply recruitment mode: exclude Scottish Premiership from scouting
+    if recruitment_mode and "competition_id" in scouting.columns:
+        before_count = len(scouting)
+        scouting = scouting[scouting["competition_id"] != 51]
+        excluded = before_count - len(scouting)
+        if excluded > 0:
+            st.info(f"🎯 Recruitment mode: excluded {excluded} Scottish Premiership player-seasons")
+    
+    # Apply season filter to scouting pool
+    if season_filter and "season_name" in scouting.columns:
+        scouting = scouting[scouting["season_name"].isin(season_filter)]
 
     if scouting.empty:
-        st.warning("No players match your filters. Widen age range, minutes, or league filter.")
+        st.warning("No players match your filters. Widen age range, minutes, league filter, or season selection.")
         return
 
     # Build X for scouting using same features (must have identical columns)
@@ -746,24 +821,40 @@ def main():
     preds = full_model.predict(scout_X.values)
     scouting = scouting.copy()
     scouting["pred_np_xg_90"] = preds
+    scouting["pred_goals_90"] = preds * finishing_factor
     scouting["residual"] = scouting[PRIMARY_TARGET].astype(float) - scouting["pred_np_xg_90"]
+    
+    # Cache scouting stats for instant player selection
+    st.session_state.scouting_pool = scouting
+    st.session_state.scouting_means = {col: scouting[col].astype(float).mean() 
+                                       for col in scouting.select_dtypes(include=[np.number]).columns}
+    st.session_state.scouting_stds = {col: scouting[col].astype(float).std(ddof=0) 
+                                      for col in scouting.select_dtypes(include=[np.number]).columns}
 
     # Display
     show_cols = [c for c in [
         "player_name", "age", "primary_position", "team_name", "league_name", "season_name",
-        "minutes", PRIMARY_TARGET, "pred_np_xg_90", "residual"
+        "minutes", PRIMARY_TARGET, "pred_np_xg_90", "pred_goals_90", "residual"
     ] if c in scouting.columns]
 
-    # rank by predicted chance generation
+    # Sort by user selection
+    sort_ascending = sort_by == "residual"  # residual can be positive or negative
+    scouting_sorted = scouting.sort_values(sort_by, ascending=sort_ascending)
+    
+    # rank by selected metric (1 = best)
     topn = st.slider("Shortlist size", 10, 100, 30, 5)
-    shortlist = scouting.sort_values("pred_np_xg_90", ascending=False).head(topn).copy()
+    shortlist = scouting_sorted.head(topn).copy()
+    shortlist["rank"] = range(1, len(shortlist) + 1)
 
+    # Update show_cols to include rank at the beginning
+    show_cols_with_rank = ["rank"] + show_cols if "rank" in shortlist.columns else show_cols
+    
     # Formatting
-    for col in ["pred_np_xg_90", PRIMARY_TARGET, "residual"]:
+    for col in ["pred_np_xg_90", "pred_goals_90", PRIMARY_TARGET, "residual"]:
         if col in shortlist.columns:
             shortlist[col] = shortlist[col].astype(float).round(3)
 
-    st.dataframe(shortlist[show_cols], use_container_width=True, hide_index=True)
+    st.dataframe(shortlist[show_cols_with_rank], use_container_width=True, hide_index=True)
 
     st.caption(
         "Tip: Residual > 0 = producing more np_xg than the model expects given traits + team context (could be role/system quirks). "
@@ -771,7 +862,7 @@ def main():
     )
 
     with st.expander("Download shortlist as CSV"):
-        csv = shortlist[show_cols].to_csv(index=False).encode("utf-8")
+        csv = shortlist[show_cols_with_rank].to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="spfl_st_shortlist.csv", mime="text/csv")
 
     st.divider()
@@ -781,25 +872,30 @@ def main():
     # -----------------------------
     st.subheader("Trait Scorecard (Top-K predictors)")
     trait_top = trait_rows.head(top_k)["feature"].tolist()
+    
+    # Cache trait_top for reuse
+    st.session_state.trait_top = trait_top
 
     # pick a player in the shortlisted pool
-    key = "player_select_key"
     player_options = shortlist["player_name"].astype(str).tolist() if "player_name" in shortlist.columns else []
     if player_options:
-        selected_player = st.selectbox("Select a player from the shortlist", player_options, index=0, key=key)
+        selected_player = st.selectbox("Select a player from the shortlist", player_options, index=0)
         row = shortlist[shortlist["player_name"].astype(str) == str(selected_player)].head(1)
         if not row.empty:
             r = row.iloc[0]
             st.markdown(f"**{r.get('player_name','')}** — {r.get('team_name','')} ({r.get('league_name','')}, {r.get('season_name','')})")
             st.write(f"Minutes: **{int(r.get('minutes',0))}** | Age: **{int(r.get('age',0))}**")
-            st.write(f"Actual {PRIMARY_TARGET}: **{r.get(PRIMARY_TARGET, np.nan):.3f}** | Predicted: **{r.get('pred_np_xg_90', np.nan):.3f}**")
+            st.write(f"Rank: **#{int(r.get('rank',0))}** | Actual {PRIMARY_TARGET}: **{r.get(PRIMARY_TARGET, np.nan):.3f}** | Predicted np_xG/90: **{r.get('pred_np_xg_90', np.nan):.3f}** | Predicted goals/90: **{r.get('pred_goals_90', np.nan):.3f}**")
 
-            # Show z-scores within the *scouting pool* for interpretability
+            # Show z-scores within the *scouting pool* for interpretability (using cached stats)
             score_df = []
+            means = st.session_state.get("scouting_means", {})
+            stds = st.session_state.get("scouting_stds", {})
+            
             for f in trait_top:
-                if f in scouting.columns and pd.api.types.is_numeric_dtype(scouting[f]):
-                    mu = scouting[f].astype(float).mean()
-                    sd = scouting[f].astype(float).std(ddof=0)
+                if f in means and f in stds:
+                    mu = means[f]
+                    sd = stds[f]
                     val = float(r.get(f, np.nan))
                     z = (val - mu) / sd if (sd and not np.isnan(val)) else np.nan
                     score_df.append({"trait": f, "value": val, "z_in_pool": z})
@@ -808,6 +904,7 @@ def main():
                 out["value"] = out["value"].round(3)
                 out["z_in_pool"] = out["z_in_pool"].round(2)
                 st.dataframe(out, use_container_width=True, hide_index=True)
+                st.caption("z_in_pool: standard deviations above/below scouting pool mean")
             else:
                 st.info("No trait columns available for scorecard (check column names).")
     else:
