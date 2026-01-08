@@ -247,17 +247,26 @@ def process_team_data(raw: pd.DataFrame) -> pd.DataFrame:
     """Strip team_season_ prefix to team_*, keep ids/names intact."""
     df = raw.copy()
     
-    # Only replace prefix at the start of column names to avoid duplicates
-    new_cols = []
+    # Build a mapping of old to new column names, avoiding duplicates
+    col_mapping = {}
+    new_col_names = set()
+    
     for c in df.columns:
         if c.startswith("team_season_"):
-            new_cols.append(c.replace("team_season_", "team_", 1))
+            new_name = c.replace("team_season_", "team_", 1)
+            # If this would create a duplicate, keep the original name
+            if new_name in new_col_names or new_name in df.columns:
+                # Drop this column as it's redundant
+                continue
+            col_mapping[c] = new_name
+            new_col_names.add(new_name)
         else:
-            new_cols.append(c)
-    df.columns = new_cols
+            col_mapping[c] = c
+            new_col_names.add(c)
     
-    # Remove any duplicate columns that might have been created
-    df = df.loc[:, ~df.columns.duplicated()]
+    # Select only columns in the mapping and rename
+    df = df[[c for c in df.columns if c in col_mapping]]
+    df = df.rename(columns=col_mapping)
 
     for col in ["team_name", "league_name", "season_name"]:
         if col in df.columns and df[col].dtype == "object":
@@ -268,6 +277,10 @@ def process_team_data(raw: pd.DataFrame) -> pd.DataFrame:
 
 def join_player_team(player_df: pd.DataFrame, team_df: pd.DataFrame) -> pd.DataFrame:
     """Attach team controls to each player-season row (same team + comp + season)."""
+    # Ensure no duplicate columns in team_df before merge
+    if team_df.columns.duplicated().any():
+        team_df = team_df.loc[:, ~team_df.columns.duplicated()]
+    
     # Prefer IDs if present
     join_cols = []
     if {"team_id", "competition_id", "season_id"}.issubset(team_df.columns) and {"team_id", "competition_id", "season_id"}.issubset(player_df.columns):
@@ -278,6 +291,8 @@ def join_player_team(player_df: pd.DataFrame, team_df: pd.DataFrame) -> pd.DataF
     # Keep only one row per team-season
     team_cols = [c for c in team_df.columns if c.startswith("team_")] + ["team_id", "team_name", "competition_id", "season_id"]
     team_cols = [c for c in team_cols if c in team_df.columns]
+    # Remove duplicates from team_cols list
+    team_cols = list(dict.fromkeys(team_cols))
     team_dedup = team_df[team_cols].drop_duplicates(subset=join_cols)
 
     merged = player_df.merge(team_dedup, on=join_cols, how="left", suffixes=("", "_team"))
