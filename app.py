@@ -531,11 +531,12 @@ def build_feature_matrix(
     target: str,
     include_team_controls: bool = True,
     add_age_poly: bool = True,
-) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str]]:
+) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str], Dict]:
     """
-    Builds X, y plus metadata: player_features, team_features
+    Builds X, y plus metadata: player_features, team_features, leakage_diagnostics
     - Player features: all numeric player columns excluding banned/leakage
     - Team controls: small list from get_team_control_columns()
+    - Leakage diagnostics: correlation analysis and dropped features
     """
 
     if target not in df.columns:
@@ -602,8 +603,61 @@ def build_feature_matrix(
     for c in X.columns:
         if X[c].isna().any():
             X[c] = X[c].fillna(X[c].median())
+    
+    # ============================================
+    # LEAKAGE DIAGNOSTICS
+    # ============================================
+    leakage_diagnostics = {
+        "correlations": {},
+        "exact_matches": [],
+        "dropped_features": [],
+        "leaky_features": []
+    }
+    
+    # Compute correlation of each feature with target
+    correlations = {}
+    for col in X.columns:
+        try:
+            # Check if column is constant
+            if X[col].std() == 0 or y.std() == 0:
+                correlations[col] = 0.0
+            else:
+                corr_val = np.corrcoef(X[col].values, y.values)[0, 1]
+                correlations[col] = corr_val if not np.isnan(corr_val) else 0.0
+        except Exception:
+            correlations[col] = 0.0
+    
+    # Identify exact matches (within numerical precision)
+    exact_matches = []
+    for col in X.columns:
+        try:
+            if np.allclose(X[col].values, y.values, atol=1e-12, rtol=0):
+                exact_matches.append(col)
+        except Exception:
+            pass
+    
+    # Identify highly correlated features (suspicious)
+    corr_series = pd.Series(correlations)
+    leaky_features = corr_series[corr_series.abs() > 0.95].index.tolist()
+    
+    # Store diagnostics
+    leakage_diagnostics["correlations"] = correlations
+    leakage_diagnostics["exact_matches"] = exact_matches
+    leakage_diagnostics["leaky_features"] = leaky_features
+    
+    # Determine which columns to drop
+    drop_cols = set(exact_matches) | set(leaky_features)
+    
+    if drop_cols:
+        leakage_diagnostics["dropped_features"] = list(drop_cols)
+        # Drop leaky columns from X
+        X = X.drop(columns=list(drop_cols))
+        
+        # Update feature lists
+        player_features = [f for f in player_features if f not in drop_cols]
+        team_features = [f for f in team_features if f not in drop_cols]
 
-    return X, y, player_features, team_features
+    return X, y, player_features, team_features, leakage_diagnostics
 
 
 def fit_elastic_net_cv(X: pd.DataFrame, y: pd.Series, random_state: int = 42) -> Pipeline:
@@ -869,7 +923,7 @@ def main():
     # Only refit if model settings changed or no cached model
     if model_settings_changed or "full_model" not in st.session_state:
         try:
-            X, y, player_feats, team_feats = build_feature_matrix(
+            X, y, player_feats, team_feats, leakage_diag = build_feature_matrix(
                 train_base,
                 target=PRIMARY_TARGET,
                 include_team_controls=include_team_controls,
@@ -878,6 +932,34 @@ def main():
         except Exception as e:
             st.error(f"Feature matrix build failed: {e}")
             return
+        
+        # Display leakage diagnostics
+        with st.expander("🔍 Leakage Diagnostics"):
+            st.markdown("### Feature Correlations with Target")
+            if leakage_diag["correlations"]:
+                corr_df = pd.DataFrame([
+                    {"feature": k, "correlation": v, "abs_corr": abs(v)}
+                    for k, v in leakage_diag["correlations"].items()
+                ]).sort_values("abs_corr", ascending=False).head(20)
+                st.dataframe(corr_df, width="stretch", hide_index=True)
+            
+            st.markdown("### Exact Match Features (perfect correlation)")
+            if leakage_diag["exact_matches"]:
+                st.error(f"Found {len(leakage_diag['exact_matches'])} exact matches: {leakage_diag['exact_matches']}")
+            else:
+                st.success("No exact matches found")
+            
+            st.markdown("### Highly Correlated Features (|corr| > 0.95)")
+            if leakage_diag["leaky_features"]:
+                st.warning(f"Found {len(leakage_diag['leaky_features'])} leaky features: {leakage_diag['leaky_features']}")
+            else:
+                st.success("No highly correlated features found")
+            
+            st.markdown("### Dropped Features")
+            if leakage_diag["dropped_features"]:
+                st.error(f"Dropped {len(leakage_diag['dropped_features'])} leaky columns: {leakage_diag['dropped_features']}")
+            else:
+                st.success("No features dropped due to leakage")
 
         if len(X) < 25:
             st.error("Training set too small after filters. Consider adding more SPFL seasons or lowering minutes threshold.")
@@ -927,6 +1009,28 @@ def main():
         else:
             trait_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
             control_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
+        
+        # Training residual diagnostics (sanity check for leakage)
+        yhat_train = full_model.predict(X.values)
+        residuals_train = y.values - yhat_train
+        train_residual_stats = {
+            "min": float(residuals_train.min()),
+            "max": float(residuals_train.max()),
+            "mean": float(residuals_train.mean()),
+            "std": float(residuals_train.std(ddof=0)),
+            "unique": int(pd.Series(residuals_train).nunique()),
+            "all_zero": bool(np.allclose(residuals_train, 0, atol=1e-10))
+        }
+        
+        with st.expander("📊 Training Residual Diagnostics"):
+            st.write("Residual statistics on training set:")
+            st.json(train_residual_stats)
+            if train_residual_stats["all_zero"]:
+                st.error("⚠️ All training residuals are ~0! This indicates perfect fit (likely leakage).")
+            elif train_residual_stats["std"] < 0.01:
+                st.warning("⚠️ Very low residual variance - possible leakage.")
+            else:
+                st.success("✓ Training residuals show normal variation.")
         
         # Cache everything
         st.session_state.full_model = full_model
@@ -1122,6 +1226,28 @@ def main():
     scouting["pred_np_xg_90"] = preds
     scouting["pred_goals_90"] = preds * finishing_factor
     scouting["residual"] = scouting[PRIMARY_TARGET].astype(float) - scouting["pred_np_xg_90"]
+    
+    # Residual diagnostics for scouting pool
+    residuals_scout = scouting["residual"].dropna()
+    if len(residuals_scout) > 0:
+        scout_residual_stats = {
+            "min": float(residuals_scout.min()),
+            "max": float(residuals_scout.max()),
+            "mean": float(residuals_scout.mean()),
+            "std": float(residuals_scout.std(ddof=0)),
+            "unique": int(residuals_scout.nunique()),
+            "all_zero": bool(np.allclose(residuals_scout.values, 0, atol=1e-10))
+        }
+        
+        with st.expander("📊 Scouting Residual Diagnostics"):
+            st.write("Residual statistics on scouting pool:")
+            st.json(scout_residual_stats)
+            if scout_residual_stats["all_zero"]:
+                st.error("⚠️ All scouting residuals are ~0! This indicates perfect predictions (likely leakage).")
+            elif scout_residual_stats["std"] < 0.01:
+                st.warning("⚠️ Very low residual variance - possible leakage or overfitting.")
+            else:
+                st.success("✓ Scouting residuals show normal variation.")
     
     # Cache scouting stats for instant player selection
     st.session_state.scouting_pool = scouting
