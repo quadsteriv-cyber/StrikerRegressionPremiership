@@ -321,12 +321,13 @@ def apply_common_filters(
 ) -> pd.DataFrame:
     out = df.copy()
 
-    # League filter
+    # League filter - only apply if NOT "All Leagues"
     if "competition_id" in out.columns:
         if league_filter == "Domestic Leagues":
             out = out[out["competition_id"].isin(DOMESTIC_LEAGUE_IDS)]
         elif league_filter == "Scottish Leagues":
             out = out[out["competition_id"].isin(SCOTTISH_LEAGUE_IDS)]
+        # else: All Leagues - no filter applied
 
     # ST only
     if "primary_position" in out.columns:
@@ -541,18 +542,21 @@ def main():
         recruitment_mode = st.checkbox("🎯 Recruitment mode: exclude Scottish Premiership players", value=False,
                                        help="Excludes competition_id 51 from scouting shortlist (training still uses SPFL)")
         
-        # Season filter for scouting pool
+        # Season filter for scouting pool - always render, compute from scouting pool after other filters
         st.caption("Season filter (scouting only):")
-        if "merged" in st.session_state and st.session_state.merged is not None:
-            available_seasons = sorted(st.session_state.merged["season_name"].dropna().unique().tolist())
-            if available_seasons:
-                season_filter = st.multiselect("Scouting season(s)", available_seasons, default=available_seasons,
-                                              help="Filter scouting pool by season (training unaffected)")
-            else:
-                season_filter = None
+        if "season_filter_options" in st.session_state and st.session_state.season_filter_options:
+            available_seasons = st.session_state.season_filter_options
+            default_seasons = st.session_state.get("season_filter_selection", available_seasons)
+            season_filter = st.multiselect(
+                "Scouting season(s)", 
+                available_seasons, 
+                default=default_seasons,
+                help="Filter scouting pool by season (training unaffected)"
+            )
+            st.session_state.season_filter_selection = season_filter
         else:
+            st.info("Load data to enable season filter")
             season_filter = None
-            st.caption("Load data to enable season filter")
 
         st.divider()
         st.header("3) Model Settings")
@@ -599,8 +603,10 @@ def main():
         st.session_state.pop("merged", None)
         st.session_state.pop("full_model", None)
         st.session_state.pop("trait_rows", None)
+        st.session_state.pop("season_filter_options", None)
 
         st.success("Data loaded.")
+        st.rerun()
 
     player_raw = st.session_state.get("player_raw")
     team_raw = st.session_state.get("team_raw")
@@ -645,7 +651,7 @@ def main():
 
     with st.expander("Preview training rows"):
         preview_cols = [c for c in ["player_name", "team_name", "season_name", "minutes", "age", PRIMARY_TARGET] if c in train_base.columns]
-        st.dataframe(train_base[preview_cols].sort_values(preview_cols[-1], ascending=False).head(30), use_container_width=True)
+        st.dataframe(train_base[preview_cols].sort_values(preview_cols[-1], ascending=False).head(30), width="stretch")
 
     # -----------------------------
     # Fit model + stability
@@ -674,19 +680,45 @@ def main():
         with st.spinner("Fitting ElasticNetCV on full training set..."):
             full_model = fit_elastic_net_cv(X, y, random_state=42)
 
-        with st.spinner("Running stability selection (bootstraps)..."):
-            stab = stability_selection(
-                X=X,
-                y=y,
-                feature_names=all_features,
-                n_boot=n_boot,
-                sample_frac=float(sample_frac),
-                random_state=42,
-            )
+        # Stability selection with robust error handling
+        stab = None
+        stability_start = time.time()
+        try:
+            with st.spinner("Running stability selection (bootstraps)..."):
+                stab = stability_selection(
+                    X=X,
+                    y=y,
+                    feature_names=all_features,
+                    n_boot=n_boot,
+                    sample_frac=float(sample_frac),
+                    random_state=42,
+                )
+            stability_time = time.time() - stability_start
+        except Exception as e:
+            stability_time = time.time() - stability_start
+            st.error(f"Stability selection failed after {stability_time:.1f}s: {e}")
+            # Create empty stability dataframe so app can continue
+            stab = pd.DataFrame({
+                "feature": all_features,
+                "selection_freq": 0.0,
+                "mean_abs_coef": 0.0
+            })
+
+        # Debug info
+        with st.expander("🔍 Model debug info"):
+            st.write(f"Training samples: {len(X)}, Features: {len(all_features)}")
+            st.write(f"Bootstrap settings: n_boot={n_boot}, sample_frac={sample_frac}")
+            st.write(f"Stability selection time: {stability_time:.1f}s")
+            if stab is not None:
+                st.write(f"Features selected (freq>0): {(stab['selection_freq'] > 0).sum()}")
 
         # Separate "player traits" from "team controls" for interpretation
-        trait_rows = stab[stab["feature"].isin(player_feats)].copy()
-        control_rows = stab[stab["feature"].isin(team_feats)].copy()
+        if stab is not None and not stab.empty:
+            trait_rows = stab[stab["feature"].isin(player_feats)].copy()
+            control_rows = stab[stab["feature"].isin(team_feats)].copy()
+        else:
+            trait_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
+            control_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
         
         # Cache everything
         st.session_state.full_model = full_model
@@ -715,9 +747,6 @@ def main():
         f"Non-zero coefs={int(np.sum(enet.coef_ != 0))}/{len(all_features)}"
     )
 
-    # Separate “player traits” from “team controls” for interpretation
-    trait_rows = stab[stab["feature"].isin(player_feats)].copy()
-    control_rows = stab[stab["feature"].isin(team_feats)].copy()
 
     left, right = st.columns([1.2, 1.0], gap="large")
 
@@ -728,7 +757,7 @@ def main():
                 selection_freq=lambda d: (100 * d["selection_freq"]).round(1),
                 mean_abs_coef=lambda d: d["mean_abs_coef"].round(3),
             ).rename(columns={"selection_freq": "selected_%", "mean_abs_coef": "mean|coef|"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -742,7 +771,7 @@ def main():
                 selection_freq=lambda d: (100 * d["selection_freq"]).round(1),
                 mean_abs_coef=lambda d: d["mean_abs_coef"].round(3),
             ).rename(columns={"selection_freq": "selected_%", "mean_abs_coef": "mean|coef|"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -759,7 +788,7 @@ def main():
                         selection_freq=lambda d: (100 * d["selection_freq"]).round(1),
                         mean_abs_coef=lambda d: d["mean_abs_coef"].round(3),
                     ).rename(columns={"selection_freq": "selected_%", "mean_abs_coef": "mean|coef|"}),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -774,10 +803,36 @@ def main():
     st.divider()
 
     # -----------------------------
+    # Data coverage summary
+    # -----------------------------
+    with st.expander("📊 Data Coverage"):
+        st.markdown("### Configured competitions")
+        st.write(f"Total competitions configured: {len(COMPETITION_SEASONS)}")
+        st.write(f"Total season requests: {sum(len(v) for v in COMPETITION_SEASONS.values())}")
+        config_df = pd.DataFrame([
+            {"comp_id": k, "league": LEAGUE_NAMES.get(k, f"Comp {k}"), "seasons": len(v)}
+            for k, v in COMPETITION_SEASONS.items()
+        ])
+        st.dataframe(config_df, width="stretch", hide_index=True)
+        
+        st.markdown("### Raw merged data (pre-filters)")
+        if "competition_id" in merged.columns:
+            st.write(f"Total rows: {len(merged):,}")
+            st.write(f"Unique competitions: {merged['competition_id'].nunique()}")
+            comp_counts = merged['competition_id'].value_counts().head(30)
+            comp_counts_df = pd.DataFrame({
+                "competition_id": comp_counts.index,
+                "league_name": [LEAGUE_NAMES.get(c, f"Comp {c}") for c in comp_counts.index],
+                "count": comp_counts.values
+            })
+            st.dataframe(comp_counts_df, width="stretch", hide_index=True)
+
+    # -----------------------------
     # SCOUTING POOL: apply user filters (age + league + recruitment mode + season)
     # -----------------------------
     st.subheader("Scouting Shortlist (filters applied)")
 
+    # Apply filters step by step
     scouting = apply_common_filters(
         merged,
         min_minutes=min_minutes,
@@ -792,6 +847,33 @@ def main():
         excluded = before_count - len(scouting)
         if excluded > 0:
             st.info(f"🎯 Recruitment mode: excluded {excluded} Scottish Premiership player-seasons")
+    
+    # Compute season filter options from current scouting pool (after league/recruitment filters)
+    if "season_name" in scouting.columns and not scouting.empty:
+        available_seasons_now = sorted(scouting["season_name"].dropna().unique().tolist())
+        if available_seasons_now:
+            st.session_state.season_filter_options = available_seasons_now
+            # Initialize selection if not set
+            if "season_filter_selection" not in st.session_state:
+                st.session_state.season_filter_selection = available_seasons_now
+    
+    # Show scouting pool coverage before season filter
+    with st.expander("📊 Scouting pool coverage (after league/recruitment/age/mins filters)"):
+        if "competition_id" in scouting.columns:
+            st.write(f"Total rows: {len(scouting):,}")
+            st.write(f"Unique competitions: {scouting['competition_id'].nunique()}")
+            st.markdown("**Competitions:**")
+            comp_counts = scouting['competition_id'].value_counts().head(30)
+            comp_counts_df = pd.DataFrame({
+                "competition_id": comp_counts.index,
+                "league_name": [LEAGUE_NAMES.get(c, f"Comp {c}") for c in comp_counts.index],
+                "count": comp_counts.values
+            })
+            st.dataframe(comp_counts_df, width="stretch", hide_index=True)
+            
+            st.markdown("**Seasons available:**")
+            season_counts = scouting['season_name'].value_counts()
+            st.dataframe(season_counts, width="stretch")
     
     # Apply season filter to scouting pool
     if season_filter and "season_name" in scouting.columns:
@@ -854,7 +936,7 @@ def main():
         if col in shortlist.columns:
             shortlist[col] = shortlist[col].astype(float).round(3)
 
-    st.dataframe(shortlist[show_cols_with_rank], use_container_width=True, hide_index=True)
+    st.dataframe(shortlist[show_cols_with_rank], width="stretch", hide_index=True)
 
     st.caption(
         "Tip: Residual > 0 = producing more np_xg than the model expects given traits + team context (could be role/system quirks). "
@@ -903,7 +985,7 @@ def main():
                 out = pd.DataFrame(score_df)
                 out["value"] = out["value"].round(3)
                 out["z_in_pool"] = out["z_in_pool"].round(2)
-                st.dataframe(out, use_container_width=True, hide_index=True)
+                st.dataframe(out, width="stretch", hide_index=True)
                 st.caption("z_in_pool: standard deviations above/below scouting pool mean")
             else:
                 st.info("No trait columns available for scorecard (check column names).")
