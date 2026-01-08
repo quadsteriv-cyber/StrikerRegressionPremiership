@@ -37,23 +37,54 @@ from sklearn.model_selection import KFold
 # 0) CONFIG — leagues/seasons
 # -----------------------------
 
-# Same IDs used in your previous file (keep in sync with your licensed access).
+# Full league mapping (52 combos)
 LEAGUE_NAMES: Dict[int, str] = {
     4: "League One",
     5: "League Two",
-    51: "Scottish Premiership",
-    107: "Irish Premier Division",
-    1385: "Scottish Championship",
+    51: "Premiership",
+    65: "National League",
+    76: "Liga",
+    78: "1. HNL",
+    89: "USL Championship",
+    106: "Veikkausliiga",
+    107: "Premier Division",
+    129: "Championnat National",
+    166: "Premier League 2 Division One",
+    179: "3. Liga",
+    260: "1st Division",
+    1035: "First Division B",
+    1385: "Championship",
+    1442: "1. Division",
+    1581: "2. Liga",
+    1607: "Úrvalsdeild",
+    1778: "First Division",
+    1848: "I Liga",
+    1865: "First League",
 }
 
-# Season IDs (from your previous working file).
-# These correspond to StatsBomb “season_id” values, not calendar years.
+# Season IDs - full 52-combo mapping
 COMPETITION_SEASONS: Dict[int, List[int]] = {
     4: [235, 281, 317, 318],
     5: [235, 281, 317, 318],
     51: [235, 281, 317, 318],
+    65: [281, 318],
+    76: [317, 318],
+    78: [317, 318],
+    89: [106, 107, 282, 315],
+    106: [315],
     107: [106, 107, 282, 315],
+    129: [317, 318],
+    166: [318],
+    179: [317, 318],
+    260: [317, 318],
+    1035: [317, 318],
     1385: [235, 281, 317, 318],
+    1442: [107, 282, 315],
+    1581: [317, 318],
+    1607: [315],
+    1778: [282, 315],
+    1848: [281, 317, 318],
+    1865: [318],
 }
 
 # Filters requested
@@ -82,7 +113,7 @@ PRIMARY_TARGET = "np_xg_90"  # after prefix stripping
 @st.cache_resource(ttl=3600)
 def fetch_player_season_stats(auth: Tuple[str, str]) -> Optional[pd.DataFrame]:
     """Fetch player-season stats for all configured league/season combos."""
-    # Quick auth test (as in your prior file)
+    # Quick auth test
     try:
         test_url = "https://data.statsbombservices.com/api/v4/competitions"
         r = requests.get(test_url, auth=auth, timeout=30)
@@ -97,7 +128,8 @@ def fetch_player_season_stats(auth: Tuple[str, str]) -> Optional[pd.DataFrame]:
 
     frames: List[pd.DataFrame] = []
     done = 0
-    failures = 0
+    success_log = []
+    failure_log = []
 
     for comp_id, season_ids in COMPETITION_SEASONS.items():
         league_name = LEAGUE_NAMES.get(comp_id, f"Competition {comp_id}")
@@ -109,32 +141,85 @@ def fetch_player_season_stats(auth: Tuple[str, str]) -> Optional[pd.DataFrame]:
             url = f"https://data.statsbombservices.com/api/v1/competitions/{comp_id}/seasons/{season_id}/player-stats"
             try:
                 resp = requests.get(url, auth=auth, timeout=60)
+                http_status = resp.status_code
+                
+                if http_status != 200:
+                    failure_log.append({
+                        "endpoint": "player-stats",
+                        "competition_id": comp_id,
+                        "league_name": league_name,
+                        "season_id": season_id,
+                        "http_status": http_status,
+                        "error": f"HTTP {http_status}",
+                        "response_snippet": resp.text[:200] if resp.text else "(no response body)"
+                    })
+                    continue
+                
                 resp.raise_for_status()
                 data = resp.json()
+                
                 if not data:
-                    failures += 1
+                    failure_log.append({
+                        "endpoint": "player-stats",
+                        "competition_id": comp_id,
+                        "league_name": league_name,
+                        "season_id": season_id,
+                        "http_status": http_status,
+                        "error": "Empty response",
+                        "response_snippet": "[]"
+                    })
                     continue
+                    
                 df = pd.json_normalize(data)
                 if df.empty:
-                    failures += 1
+                    failure_log.append({
+                        "endpoint": "player-stats",
+                        "competition_id": comp_id,
+                        "league_name": league_name,
+                        "season_id": season_id,
+                        "http_status": http_status,
+                        "error": "Empty dataframe after normalize",
+                        "response_snippet": f"{len(data)} items but empty df"
+                    })
                     continue
+                    
                 df["league_name"] = league_name
                 df["competition_id"] = comp_id
                 df["season_id"] = season_id
                 frames.append(df)
-            except Exception:
-                failures += 1
+                success_log.append({
+                    "endpoint": "player-stats",
+                    "competition_id": comp_id,
+                    "league_name": league_name,
+                    "season_id": season_id,
+                    "rows": len(df)
+                })
+            except Exception as e:
+                failure_log.append({
+                    "endpoint": "player-stats",
+                    "competition_id": comp_id,
+                    "league_name": league_name,
+                    "season_id": season_id,
+                    "http_status": getattr(resp, 'status_code', 'N/A') if 'resp' in locals() else 'N/A',
+                    "error": f"{type(e).__name__}: {str(e)}",
+                    "response_snippet": ""
+                })
                 continue
 
     progress.empty()
     status.empty()
+    
+    # Store logs in session state
+    st.session_state["player_fetch_success_log"] = success_log
+    st.session_state["player_fetch_failure_log"] = failure_log
 
     if not frames:
-        st.error("No player-stats returned. Check league/season IDs and your licensed access.")
+        st.error(f"No player-stats returned. Attempted {total_requests} requests, succeeded 0, failed {len(failure_log)}.")
         return None
 
-    if failures:
-        st.warning(f"Some league/season requests failed: {failures}.")
+    success_count = len(success_log)
+    failure_count = len(failure_log)
+    st.success(f"Player stats: attempted {total_requests}, succeeded {success_count}, failed {failure_count}")
 
     return pd.concat(frames, ignore_index=True)
 
@@ -148,7 +233,8 @@ def fetch_team_season_stats(auth: Tuple[str, str]) -> Optional[pd.DataFrame]:
 
     frames: List[pd.DataFrame] = []
     done = 0
-    failures = 0
+    success_log = []
+    failure_log = []
 
     for comp_id, season_ids in COMPETITION_SEASONS.items():
         league_name = LEAGUE_NAMES.get(comp_id, f"Competition {comp_id}")
@@ -157,37 +243,88 @@ def fetch_team_season_stats(auth: Tuple[str, str]) -> Optional[pd.DataFrame]:
             progress.progress(done / total_requests)
             status.text(f"Loading team-stats: {league_name} | season_id={season_id} ({done}/{total_requests})")
 
-            # Team stats endpoint per StatsBomb season team stats spec:
-            # https://data.statsbombservices.com/api/v2/competitions/{comp}/seasons/{season}/team-stats
             url = f"https://data.statsbombservices.com/api/v2/competitions/{comp_id}/seasons/{season_id}/team-stats"
             try:
                 resp = requests.get(url, auth=auth, timeout=60)
+                http_status = resp.status_code
+                
+                if http_status != 200:
+                    failure_log.append({
+                        "endpoint": "team-stats",
+                        "competition_id": comp_id,
+                        "league_name": league_name,
+                        "season_id": season_id,
+                        "http_status": http_status,
+                        "error": f"HTTP {http_status}",
+                        "response_snippet": resp.text[:200] if resp.text else "(no response body)"
+                    })
+                    continue
+                
                 resp.raise_for_status()
                 data = resp.json()
+                
                 if not data:
-                    failures += 1
+                    failure_log.append({
+                        "endpoint": "team-stats",
+                        "competition_id": comp_id,
+                        "league_name": league_name,
+                        "season_id": season_id,
+                        "http_status": http_status,
+                        "error": "Empty response",
+                        "response_snippet": "[]"
+                    })
                     continue
+                    
                 df = pd.json_normalize(data)
                 if df.empty:
-                    failures += 1
+                    failure_log.append({
+                        "endpoint": "team-stats",
+                        "competition_id": comp_id,
+                        "league_name": league_name,
+                        "season_id": season_id,
+                        "http_status": http_status,
+                        "error": "Empty dataframe after normalize",
+                        "response_snippet": f"{len(data)} items but empty df"
+                    })
                     continue
+                    
                 df["league_name"] = league_name
                 df["competition_id"] = comp_id
                 df["season_id"] = season_id
                 frames.append(df)
-            except Exception:
-                failures += 1
+                success_log.append({
+                    "endpoint": "team-stats",
+                    "competition_id": comp_id,
+                    "league_name": league_name,
+                    "season_id": season_id,
+                    "rows": len(df)
+                })
+            except Exception as e:
+                failure_log.append({
+                    "endpoint": "team-stats",
+                    "competition_id": comp_id,
+                    "league_name": league_name,
+                    "season_id": season_id,
+                    "http_status": getattr(resp, 'status_code', 'N/A') if 'resp' in locals() else 'N/A',
+                    "error": f"{type(e).__name__}: {str(e)}",
+                    "response_snippet": ""
+                })
                 continue
 
     progress.empty()
     status.empty()
+    
+    # Store logs in session state
+    st.session_state["team_fetch_success_log"] = success_log
+    st.session_state["team_fetch_failure_log"] = failure_log
 
     if not frames:
-        st.error("No team-stats returned. Check league/season IDs and your licensed access.")
+        st.error(f"No team-stats returned. Attempted {total_requests} requests, succeeded 0, failed {len(failure_log)}.")
         return None
 
-    if failures:
-        st.warning(f"Some league/season team-stats requests failed: {failures}.")
+    success_count = len(success_log)
+    failure_count = len(failure_log)
+    st.success(f"Team stats: attempted {total_requests}, succeeded {success_count}, failed {failure_count}")
 
     return pd.concat(frames, ignore_index=True)
 
@@ -304,13 +441,32 @@ def join_player_team(player_df: pd.DataFrame, team_df: pd.DataFrame) -> pd.DataF
 # -----------------------------
 
 def is_striker_label(x) -> bool:
+    """Enhanced striker detection to handle various position labels across leagues."""
     if pd.isna(x):
         return False
+    
+    # Handle numeric position codes - skip position filtering for numeric values
+    # (different leagues may use different numeric codes)
+    if isinstance(x, (int, float)):
+        return True  # Don't filter out numeric positions
+    
     s = str(x).strip()
-    if s in ST_POSITION_LABELS:
+    
+    # Exact matches (case-insensitive)
+    exact_matches = {
+        "CF", "Centre Forward", "Center Forward", "ST", "Striker", 
+        "Forward", "9", "Left Centre Forward", "Right Centre Forward",
+        "Secondary Striker", "Left Center Forward", "Right Center Forward"
+    }
+    if s in exact_matches or s.lower() in {m.lower() for m in exact_matches}:
         return True
-    # Fallback heuristic: if your API returns richer labels
-    return ("Forward" in s) or ("Striker" in s) or (s == "9")
+    
+    # Substring matches (case-insensitive)
+    s_lower = s.lower()
+    if "forward" in s_lower or "striker" in s_lower:
+        return True
+    
+    return False
 
 
 def apply_common_filters(
@@ -614,6 +770,51 @@ def main():
         st.warning("No data loaded yet.")
         return
 
+    # Show configuration
+    with st.expander("⚙️ Configuration"):
+        st.write(f"**Leagues configured:** {len(LEAGUE_NAMES)}")
+        st.write(f"**Total season requests:** {sum(len(v) for v in COMPETITION_SEASONS.values())}")
+        config_df = pd.DataFrame([
+            {"comp_id": k, "league": LEAGUE_NAMES.get(k, f"Comp {k}"), "seasons": len(v), "season_ids": str(v)}
+            for k, v in COMPETITION_SEASONS.items()
+        ])
+        st.dataframe(config_df, width="stretch", hide_index=True)
+    
+    # Show fetch logs
+    if "player_fetch_success_log" in st.session_state:
+        with st.expander("✅ Fetch Successes"):
+            p_success = st.session_state.get("player_fetch_success_log", [])
+            t_success = st.session_state.get("team_fetch_success_log", [])
+            
+            if p_success:
+                st.markdown("**Player stats successes:**")
+                p_df = pd.DataFrame(p_success)
+                success_by_comp = p_df.groupby(['competition_id', 'league_name']).agg(
+                    requests=('season_id', 'count'),
+                    total_rows=('rows', 'sum')
+                ).reset_index()
+                st.dataframe(success_by_comp, width="stretch", hide_index=True)
+            
+            if t_success:
+                st.markdown("**Team stats successes:**")
+                t_df = pd.DataFrame(t_success)
+                success_by_comp = t_df.groupby(['competition_id', 'league_name']).agg(
+                    requests=('season_id', 'count'),
+                    total_rows=('rows', 'sum')
+                ).reset_index()
+                st.dataframe(success_by_comp, width="stretch", hide_index=True)
+    
+    if "player_fetch_failure_log" in st.session_state:
+        p_failures = st.session_state.get("player_fetch_failure_log", [])
+        t_failures = st.session_state.get("team_fetch_failure_log", [])
+        
+        if p_failures or t_failures:
+            with st.expander(f"❌ Fetch Failures ({len(p_failures) + len(t_failures)} total)"):
+                all_failures = p_failures + t_failures
+                if all_failures:
+                    fail_df = pd.DataFrame(all_failures)
+                    st.dataframe(fail_df, width="stretch", hide_index=True)
+
     # Process + join (cache in session state)
     if "merged" not in st.session_state or st.session_state.merged is None:
         player_df = process_player_data(player_raw)
@@ -622,6 +823,13 @@ def main():
         st.session_state.merged = merged
     else:
         merged = st.session_state.merged
+    
+    # Show unique position labels for debugging
+    with st.expander("🔍 Position Labels in Data"):
+        if "primary_position" in merged.columns:
+            pos_counts = merged["primary_position"].value_counts().head(50)
+            st.write(f"Top 50 position labels (out of {merged['primary_position'].nunique()} unique):")
+            st.dataframe(pos_counts, width="stretch")
 
     # -----------------------------
     # TRAINING SET: SPFL-only STs >=900 mins
@@ -803,29 +1011,38 @@ def main():
     st.divider()
 
     # -----------------------------
-    # Data coverage summary
+    # Data coverage summary - MERGED BEFORE FILTERS
     # -----------------------------
-    with st.expander("📊 Data Coverage"):
-        st.markdown("### Configured competitions")
-        st.write(f"Total competitions configured: {len(COMPETITION_SEASONS)}")
-        st.write(f"Total season requests: {sum(len(v) for v in COMPETITION_SEASONS.values())}")
-        config_df = pd.DataFrame([
-            {"comp_id": k, "league": LEAGUE_NAMES.get(k, f"Comp {k}"), "seasons": len(v)}
-            for k, v in COMPETITION_SEASONS.items()
-        ])
-        st.dataframe(config_df, width="stretch", hide_index=True)
+    with st.expander("📊 Coverage: Merged Data (BEFORE Filters)"):
+        st.markdown("### Data immediately after join_player_team()")
+        st.write(f"**Total rows:** {len(merged):,}")
+        st.write(f"**Unique players:** {merged['player_id'].nunique() if 'player_id' in merged.columns else merged['player_name'].nunique()}")
+        st.write(f"**Unique teams:** {merged['team_name'].nunique() if 'team_name' in merged.columns else 'N/A'}")
+        st.write(f"**Unique competitions:** {merged['competition_id'].nunique() if 'competition_id' in merged.columns else 'N/A'}")
+        st.write(f"**Unique seasons:** {merged['season_id'].nunique() if 'season_id' in merged.columns else 'N/A'}")
         
-        st.markdown("### Raw merged data (pre-filters)")
         if "competition_id" in merged.columns:
-            st.write(f"Total rows: {len(merged):,}")
-            st.write(f"Unique competitions: {merged['competition_id'].nunique()}")
-            comp_counts = merged['competition_id'].value_counts().head(30)
+            st.markdown("### Competition distribution (sorted by count)")
+            comp_counts = merged['competition_id'].value_counts()
             comp_counts_df = pd.DataFrame({
                 "competition_id": comp_counts.index,
                 "league_name": [LEAGUE_NAMES.get(c, f"Comp {c}") for c in comp_counts.index],
-                "count": comp_counts.values
+                "player_seasons": comp_counts.values,
+                "pct": (100 * comp_counts.values / len(merged)).round(1)
             })
             st.dataframe(comp_counts_df, width="stretch", hide_index=True)
+            
+            # Show which configured leagues are MISSING
+            fetched_comps = set(merged['competition_id'].unique())
+            configured_comps = set(COMPETITION_SEASONS.keys())
+            missing_comps = configured_comps - fetched_comps
+            if missing_comps:
+                st.warning(f"⚠️ {len(missing_comps)} configured competitions have ZERO rows:")
+                missing_df = pd.DataFrame([
+                    {"comp_id": c, "league": LEAGUE_NAMES.get(c, f"Comp {c}")}
+                    for c in sorted(missing_comps)
+                ])
+                st.dataframe(missing_df, width="stretch", hide_index=True)
 
     # -----------------------------
     # SCOUTING POOL: apply user filters (age + league + recruitment mode + season)
