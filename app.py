@@ -246,7 +246,18 @@ def process_player_data(raw: pd.DataFrame) -> pd.DataFrame:
 def process_team_data(raw: pd.DataFrame) -> pd.DataFrame:
     """Strip team_season_ prefix to team_*, keep ids/names intact."""
     df = raw.copy()
-    df.columns = [c.replace("team_season_", "team_") for c in df.columns]
+    
+    # Only replace prefix at the start of column names to avoid duplicates
+    new_cols = []
+    for c in df.columns:
+        if c.startswith("team_season_"):
+            new_cols.append(c.replace("team_season_", "team_", 1))
+        else:
+            new_cols.append(c)
+    df.columns = new_cols
+    
+    # Remove any duplicate columns that might have been created
+    df = df.loc[:, ~df.columns.duplicated()]
 
     for col in ["team_name", "league_name", "season_name"]:
         if col in df.columns and df[col].dtype == "object":
