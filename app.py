@@ -564,11 +564,17 @@ def build_feature_matrix(
     
     # HARD EXCLUSIONS (ALWAYS applied, regardless of toggles)
     hard_exclusion_patterns = [
+        # xG & derivatives
         "xg", "npxg", "np_xg", "xg_per", "xg_90",
+        # outcomes / finishing
+        "goal", "goals", "npg", "npgoals",
         "conversion", "shot_conversion",
-        "goals", "goal", "npg", "npgoals",
+        # assists
         "assist", "assists", "xa",
+        # defensive outcomes
         "npga", "goals_against", "ga", "conceded",
+        # 🔴 SHOT IDENTITY LEAKAGE (np_xg_90 ≈ shots × shot_quality)
+        "shot", "shots",
     ]
     
     hard_bans = {
@@ -586,6 +592,9 @@ def build_feature_matrix(
         "npga", "npga_90", "goals_against", "ga", "conceded",
         # Minutes (hard leakage)
         "minutes", "player_season_minutes",
+        # 🔴 Shot-based features (identity leakage: np_xg ≈ shots × quality)
+        "np_shots_90", "shots_90", "shots", "shot",
+        "shot_touch_ratio", "shots_on_target", "shots_on_target_90",
         # Other outcome proxies
         "shots_faced_90", "save_ratio",
     }
@@ -595,19 +604,28 @@ def build_feature_matrix(
         col_lower = col_name.lower()
         return any(pattern in col_lower for pattern in hard_exclusion_patterns)
     
-    # BEHAVIOUR-ONLY WHITELIST
+    # BEHAVIOUR-ONLY WHITELIST (upstream actions only, NO outcomes)
     allowed_player_behaviours = [
+        # Touches (upstream possession behaviours)
         "touch", "touches_inside_box", "box_touch",
-        "shot_touch_ratio",
-        "shots_", "np_shots",  # shot COUNTS, not xG per shot
+        # NOTE: shot_touch_ratio REMOVED - it's outcome-derived
+        # NOTE: shots_, np_shots REMOVED - shot counts are outcomes
+        # Defensive actions
         "press", "pressure", "counterpress",
+        # Ball progression
         "carry", "dribble",
+        # Receiving
         "receive", "receptions", "received",
+        # Passing
         "pass", "key_pass", "passes_inside_box",
+        # Duels
         "aerial", "duel",
+        # Other actions
         "foul_won", "turnover",
+        # Movement/positioning
         "distance", "average_x_pass",
-        "obv",  # on-ball value (not outcome-derived)
+        # On-ball value (action-based, not outcome)
+        "obv",
     ]
     
     allowed_team_patterns = [
