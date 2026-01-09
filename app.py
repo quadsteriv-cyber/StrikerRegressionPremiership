@@ -535,6 +535,7 @@ def build_feature_matrix(
     include_team_controls: bool = True,
     add_age_poly: bool = True,
     enable_league_fixed_effects: bool = False,
+    allow_xg_identity: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str], Dict]:
     """
     Builds X, y plus metadata: player_features, team_features, leakage_diagnostics
@@ -556,24 +557,43 @@ def build_feature_matrix(
         "canonical_season",
     }
 
-    # Leak / tautology bans (anything too close to outcome)
+    # PHASE 2: Enhanced leak / tautology bans (anything too close to outcome)
     # We are modelling np_xg_90, so bans include np_xg itself (target), and goal/finishing variables.
     bans = {
         target,
+        # Target aliases (ALWAYS banned)
+        "np_xg", "npxg", "np_xg_per_90", "npxg_90",
         # Goal outcomes / finishing / conversion
         "goals_90", "npg_90", "goals", "npg",
-        "conversion_ratio", "shot_on_target_ratio",
+        "conversion_ratio", "shot_on_target_ratio", "shot_conversion",
         "over_under_performance_90", "penalty_goals_90",
         "penalty_conversion_ratio",
+        # Minutes (hard leakage)
+        "minutes", "player_season_minutes",
         # direct derived combos (if present)
         "shots_faced_90", "save_ratio",
     }
+
+    # PHASE 1: xG-identity exclusion (unless explicitly allowed)
+    xg_identity_patterns = ["xg", "npxg", "np_xg", "xg_per", "shots_90", "shots_pg", "xg_90"]
+    
+    def is_xg_identity(col_name: str) -> bool:
+        """Check if column name matches xG-identity patterns."""
+        col_lower = col_name.lower()
+        return any(pattern in col_lower for pattern in xg_identity_patterns)
 
     # Numeric columns
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     player_num = [c for c in num_cols if (c not in non_feature_cols) and (not c.startswith("team_")) and (c not in bans)]
 
+    # Apply xG-identity filter if disabled
+    if not allow_xg_identity:
+        player_num = [c for c in player_num if not is_xg_identity(c)]
+
     team_cols = get_team_control_columns(df) if include_team_controls else []
+    # Also filter team controls for xG-identity
+    if not allow_xg_identity:
+        team_cols = [c for c in team_cols if not is_xg_identity(c)]
 
     X = df[player_num + team_cols].copy()
 
@@ -654,12 +674,17 @@ def build_feature_matrix(
     corr_series = pd.Series(correlations)
     leaky_features = corr_series[corr_series.abs() > 0.95].index.tolist()
     
+    # PHASE 0: Track xG-derived features for diagnostics
+    xg_derived = [c for c in X.columns if is_xg_identity(c)]
+    
     # Store diagnostics
     leakage_diagnostics["correlations"] = correlations
     leakage_diagnostics["exact_matches"] = exact_matches
     leakage_diagnostics["leaky_features"] = leaky_features
+    leakage_diagnostics["xg_derived_features"] = xg_derived
+    leakage_diagnostics["xg_derived_count"] = len(xg_derived)
     
-    # Determine which columns to drop
+    # Determine which columns to drop (PHASE 2: auto-drop high correlation)
     drop_cols = set(exact_matches) | set(leaky_features)
     
     if drop_cols:
@@ -670,6 +695,8 @@ def build_feature_matrix(
         # Update feature lists
         player_features = [f for f in player_features if f not in drop_cols]
         team_features = [f for f in team_features if f not in drop_cols]
+    else:
+        leakage_diagnostics["dropped_features"] = []
 
     return X, y, player_features, team_features, leakage_diagnostics
 
@@ -811,7 +838,7 @@ def main():
         load_btn = st.button("Load / Refresh Data", type="primary")
 
     # Check if model settings changed (requires refit)
-    model_settings_key = f"{include_team_controls}_{add_age_poly}_{enable_league_fe}_{n_boot}_{sample_frac}"
+    model_settings_key = f"{include_team_controls}_{add_age_poly}_{enable_league_fe}_{allow_xg_identity}_{n_boot}_{sample_frac}"
     model_settings_changed = st.session_state.get("model_settings_key") != model_settings_key
     
     # Persist data in session state
@@ -979,6 +1006,7 @@ def main():
                 include_team_controls=include_team_controls,
                 add_age_poly=add_age_poly,
                 enable_league_fixed_effects=enable_league_fe,
+                allow_xg_identity=allow_xg_identity,
             )
         except Exception as e:
             st.error(f"Feature matrix build failed: {e}")
@@ -1061,27 +1089,46 @@ def main():
             trait_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
             control_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
         
-        # Training residual diagnostics (sanity check for leakage)
+        # PHASE 3: Training residual diagnostics (FULL PRECISION)
         yhat_train = full_model.predict(X.values)
-        residuals_train = y.values - yhat_train
+        residuals_train = y.values - yhat_train  # Full precision, no rounding
         train_residual_stats = {
             "min": float(residuals_train.min()),
             "max": float(residuals_train.max()),
             "mean": float(residuals_train.mean()),
-            "std": float(residuals_train.std(ddof=0)),
+            "std": float(residuals_train.std(ddof=1)),  # Sample std
+            "mean_abs": float(np.mean(np.abs(residuals_train))),
+            "max_abs": float(np.max(np.abs(residuals_train))),
             "unique": int(pd.Series(residuals_train).nunique()),
             "all_zero": bool(np.allclose(residuals_train, 0, atol=1e-10))
         }
         
-        with st.expander("📊 Training Residual Diagnostics"):
-            st.write("Residual statistics on training set:")
-            st.json(train_residual_stats)
+        # PHASE 4: Expected behaviour check
+        if train_residual_stats["std"] < 1e-3:
+            st.error("""
+            🚨 **CRITICAL WARNING**: Residual variance is extremely small (<0.001).
+            
+            The model may still be reconstructing the target from its own accounting components
+            rather than predicting from upstream behaviours. 
+            
+            **Action**: Ensure xG-identity filter is enabled (checkbox should be OFF).
+            """)
+        
+        with st.expander("📊 Residual Diagnostics", expanded=(train_residual_stats["std"] < 0.01)):
+            st.write("**Residual statistics on training set (FULL PRECISION):**")
+            # Display with 6 decimal precision
+            display_stats = {k: f"{v:.6f}" if isinstance(v, float) else v 
+                           for k, v in train_residual_stats.items()}
+            st.json(display_stats)
+            
             if train_residual_stats["all_zero"]:
                 st.error("⚠️ All training residuals are ~0! This indicates perfect fit (likely leakage).")
             elif train_residual_stats["std"] < 0.01:
-                st.warning("⚠️ Very low residual variance - possible leakage.")
+                st.warning("⚠️ Very low residual variance - possible leakage or identity reconstruction.")
+            elif train_residual_stats["std"] < 0.05:
+                st.info("ℹ️ Residual std is small but non-trivial. Model may have some predictive signal.")
             else:
-                st.success("✓ Training residuals show normal variation.")
+                st.success(f"✓ Training residuals show normal variation (std={train_residual_stats['std']:.4f})")
         
         # Cache everything
         st.session_state.full_model = full_model
@@ -1093,6 +1140,7 @@ def main():
         st.session_state.trait_rows = trait_rows
         st.session_state.control_rows = control_rows
         st.session_state.model_settings_key = model_settings_key
+        st.session_state.leakage_diag = leakage_diag  # Cache for diagnostics
     else:
         # Use cached model
         full_model = st.session_state.full_model
@@ -1103,6 +1151,85 @@ def main():
         team_feats = st.session_state.team_feats
         trait_rows = st.session_state.trait_rows
         control_rows = st.session_state.control_rows
+        leakage_diag = st.session_state.leakage_diag
+    
+    # ============================================
+    # PHASE 0: TAUTOLOGY DIAGNOSTICS
+    # ============================================
+    with st.expander("🧮 Tautology Diagnostics (Is target reconstructible?)", expanded=False):
+        st.markdown("""
+        **Purpose**: Detect if model is reconstructing np_xg_90 from its own accounting components
+        rather than predicting from upstream striker behaviours.
+        """)
+        
+        # 1) TOP COEFFICIENTS
+        st.subheader("1️⃣ Top Coefficients")
+        try:
+            enet_model = full_model.named_steps["enet"]
+            coefs = enet_model.coef_
+            coef_df = pd.DataFrame({
+                "feature": all_features,
+                "coef": coefs,
+                "abs_coef": np.abs(coefs)
+            }).sort_values("abs_coef", ascending=False).head(20)
+            st.dataframe(coef_df, width=700, hide_index=True)
+        except Exception as e:
+            st.error(f"Could not extract coefficients: {e}")
+        
+        # 2) xG-DERIVED FEATURE AUDIT
+        st.subheader("2️⃣ xG-Derived Feature Audit")
+        xg_derived = leakage_diag.get("xg_derived_features", [])
+        xg_count = leakage_diag.get("xg_derived_count", 0)
+        st.metric("xG-derived features in X", xg_count)
+        if xg_derived:
+            st.write("Features matching xG-identity patterns:")
+            st.write(xg_derived[:30])  # Show up to 30
+            if not allow_xg_identity:
+                st.info("✓ xG-identity filter is ENABLED - these features were excluded during training")
+        else:
+            st.success("✓ No xG-derived features found in feature matrix")
+        
+        # 3) IDENTITY RECONSTRUCTION TEST
+        st.subheader("3️⃣ Identity Reconstruction Test")
+        if xg_derived and allow_xg_identity:
+            try:
+                from sklearn.linear_model import Ridge
+                # Get xG features present in X
+                xg_in_X = [f for f in xg_derived if f in X.columns]
+                if len(xg_in_X) > 0:
+                    X_xg_only = X[xg_in_X].copy()
+                    # Fit simple model on xG features only
+                    ridge_xg = Ridge(alpha=1.0)
+                    ridge_xg.fit(X_xg_only.values, y.values)
+                    y_pred_xg = ridge_xg.predict(X_xg_only.values)
+                    resid_xg = y.values - y_pred_xg
+                    resid_xg_std = float(np.std(resid_xg, ddof=1))
+                    
+                    # Compare to main model
+                    y_pred_main = full_model.predict(X.values)
+                    resid_main = y.values - y_pred_main
+                    resid_main_std = float(np.std(resid_main, ddof=1))
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Residual std (xG features only)", f"{resid_xg_std:.6f}")
+                    with col2:
+                        st.metric("Residual std (main model)", f"{resid_main_std:.6f}")
+                    
+                    if resid_xg_std < 0.01:
+                        st.error("⚠️ xG-only model has tiny residuals! Target is reconstructible from xG components.")
+                    elif resid_main_std < resid_xg_std * 1.2:
+                        st.warning("⚠️ Main model residuals similar to xG-only - possible identity leakage")
+                    else:
+                        st.success("✓ Main model performs differently than xG-only reconstruction")
+                else:
+                    st.info("No xG-derived features present in training matrix")
+            except Exception as e:
+                st.error(f"Reconstruction test failed: {e}")
+        elif not allow_xg_identity:
+            st.success("✓ xG-identity filter is enabled - reconstruction test not needed")
+        else:
+            st.info("No xG-derived features to test")
     
     # ============================================
     # PHASE 2: TEMPORAL VALIDATION
@@ -1165,10 +1292,10 @@ def main():
                 
                 try:
                     X_temp_train, y_temp_train, _, _, _ = build_feature_matrix(
-                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
+                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
                     )
                     X_temp_test, y_temp_test, _, _, _ = build_feature_matrix(
-                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
+                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
                     )
                     
                     # Align features
@@ -1243,10 +1370,10 @@ def main():
                 try:
                     # Build feature matrices
                     X_cross_train, y_cross_train, _, _, _ = build_feature_matrix(
-                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
+                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
                     )
                     X_cross_test, y_cross_test, _, _, _ = build_feature_matrix(
-                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
+                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
                     )
                     
                     # Align features
@@ -1470,23 +1597,29 @@ def main():
             np.nan
         )
     else:
+        # PHASE 3: Compute residuals at FULL PRECISION (no rounding before calculation)
         scouting["residual"] = scouting[PRIMARY_TARGET].astype(float) - scouting["pred_np_xg_90"]
     
-    # Residual diagnostics for scouting pool
+    # PHASE 3: Residual diagnostics for scouting pool (FULL PRECISION)
     residuals_scout = scouting["residual"].dropna()
     if len(residuals_scout) > 0:
         scout_residual_stats = {
             "min": float(residuals_scout.min()),
             "max": float(residuals_scout.max()),
             "mean": float(residuals_scout.mean()),
-            "std": float(residuals_scout.std(ddof=0)),
+            "std": float(residuals_scout.std(ddof=1)),  # Sample std
+            "mean_abs": float(np.mean(np.abs(residuals_scout.values))),
+            "max_abs": float(np.max(np.abs(residuals_scout.values))),
             "unique": int(residuals_scout.nunique()),
             "all_zero": bool(np.allclose(residuals_scout.values, 0, atol=1e-10))
         }
         
-        with st.expander("📊 Scouting Residual Diagnostics"):
-            st.write("Residual statistics on scouting pool:")
-            st.json(scout_residual_stats)
+        with st.expander("📊 Residual Diagnostics (Scouting Pool)", expanded=False):
+            st.write("**Residual statistics on scouting pool (FULL PRECISION):**")
+            # Display with 6 decimal precision
+            display_stats = {k: f"{v:.6f}" if isinstance(v, float) else v 
+                           for k, v in scout_residual_stats.items()}
+            st.json(display_stats)
             if scout_residual_stats["all_zero"]:
                 st.error("⚠️ All scouting residuals are ~0! This indicates perfect predictions (likely leakage).")
             elif scout_residual_stats["std"] < 0.01:
@@ -1593,12 +1726,28 @@ def main():
     # Update show_cols to include rank at the beginning
     show_cols_with_rank = ["rank"] + show_cols if "rank" in shortlist.columns else show_cols
     
-    # Formatting
-    for col in ["pred_np_xg_90", "pred_goals_90_avg_finish", PRIMARY_TARGET, "residual"]:
+    # PHASE 3: Format with proper precision - NEVER round residual to 3 decimals
+    # Use 6 decimal precision for residual, 3 for predictions
+    for col in ["pred_np_xg_90", "pred_goals_90_avg_finish", PRIMARY_TARGET]:
         if col in shortlist.columns:
             shortlist[col] = shortlist[col].astype(float).round(3)
+    
+    # PHASE 3: Keep residual at higher precision (6 decimals max)
+    if "residual" in shortlist.columns:
+        shortlist["residual"] = shortlist["residual"].astype(float)  # Full precision, no rounding
 
-    st.dataframe(shortlist[show_cols_with_rank], width="stretch", hide_index=True)
+    # Display with styling for residual column (6 decimal format)
+    def style_residual(val):
+        if pd.isna(val):
+            return ""
+        return f"{val:.6f}"
+    
+    shortlist_display = shortlist[show_cols_with_rank].copy()
+    if "residual" in shortlist_display.columns:
+        shortlist_styled = shortlist_display.style.format({"residual": style_residual})
+        st.dataframe(shortlist_styled, width="stretch", hide_index=True)
+    else:
+        st.dataframe(shortlist_display, width="stretch", hide_index=True)
 
     st.caption(
         "Tip: Residual > 0 = producing more np_xg than the model expects given traits + team context (could be role/system quirks). "
@@ -1606,7 +1755,11 @@ def main():
     )
 
     with st.expander("Download shortlist as CSV"):
-        csv = shortlist[show_cols_with_rank].to_csv(index=False).encode("utf-8")
+        # PHASE 3: Export residual at full precision (6 decimals)
+        csv_df = shortlist[show_cols_with_rank].copy()
+        if "residual" in csv_df.columns:
+            csv_df["residual"] = csv_df["residual"].apply(lambda x: f"{x:.6f}" if pd.notna(x) else "")
+        csv = csv_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="spfl_st_shortlist.csv", mime="text/csv")
 
     st.divider()
