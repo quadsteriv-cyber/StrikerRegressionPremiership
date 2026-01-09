@@ -911,6 +911,27 @@ def stability_selection(
     return out
 
 
+def shuffle_within_groups(y: pd.Series, groups: pd.Series, seed: int) -> pd.Series:
+    """Shuffle target values within each group (e.g., competition_id) to preserve league structure."""
+    rng = np.random.default_rng(seed)
+    y_perm = y.copy()
+    for g, idx in groups.groupby(groups).groups.items():
+        vals = y.loc[idx].values
+        rng.shuffle(vals)
+        y_perm.loc[idx] = vals
+    return y_perm
+
+
+def corr_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute R² as correlation squared (consistent with existing approach)."""
+    if len(y_true) < 2:
+        return np.nan
+    r = np.corrcoef(y_true, y_pred)[0, 1]
+    if np.isnan(r):
+        return np.nan
+    return float(r ** 2)
+
+
 def run_ablation_experiment(
     train_data: pd.DataFrame,
     test_data: pd.DataFrame,
@@ -1723,6 +1744,136 @@ def main():
                     
                 except Exception as e:
                     st.error(f"Cross-league test failed: {e}")
+    
+    # ============================================
+    # PERMUTATION TEST (EXPERIMENT MODE ONLY)
+    # ============================================
+    if experiment_mode:
+        with st.expander("🧪 Permutation Test (Shuffle Test)", expanded=False):
+            st.markdown("""
+            **Purpose**: Test if the model beats chance by comparing real test R² against permuted-target models.
+            
+            - Shuffles target within competition groups (preserves league structure)
+            - Fits model on shuffled data and tests on real test set
+            - If real R² > 95th percentile of permuted R², model beats chance
+            """)
+            
+            n_perm = st.slider("Number of permutations", 20, 200, 50, 10, key="n_perm_slider")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                run_perm_btn = st.button("▶️ Run Permutation Test", key="run_perm_btn")
+            with col2:
+                if st.button("🔄 Clear Results", key="clear_perm_btn"):
+                    if "perm_test_results" in st.session_state:
+                        del st.session_state["perm_test_results"]
+                    st.success("Permutation results cleared")
+            
+            if run_perm_btn:
+                with st.spinner(f"Running {n_perm} permutations..."):
+                    try:
+                        # Prepare temporal train/test split
+                        if "canonical_season" in train.columns:
+                            train_sorted = train.sort_values("canonical_season")
+                            n_train = len(train_sorted)
+                            split_idx = max(int(0.7 * n_train), 10)
+                            temporal_train = train_sorted.iloc[:split_idx]
+                            temporal_test = train_sorted.iloc[split_idx:]
+                        else:
+                            from sklearn.model_selection import train_test_split
+                            temporal_train, temporal_test = train_test_split(train, test_size=0.3, random_state=42)
+                        
+                        # Build feature matrices
+                        X_train_perm, y_train_perm, _, _, _ = build_feature_matrix(
+                            temporal_train, PRIMARY_TARGET, include_team_controls, add_age_poly, 
+                            enable_league_fe, behaviour_only, allow_xg_identity
+                        )
+                        X_test_perm, y_test_perm, _, _, _ = build_feature_matrix(
+                            temporal_test, PRIMARY_TARGET, include_team_controls, add_age_poly,
+                            enable_league_fe, behaviour_only, allow_xg_identity
+                        )
+                        
+                        # Align features
+                        common_features = list(set(X_train_perm.columns) & set(X_test_perm.columns))
+                        X_train_perm = X_train_perm[common_features]
+                        X_test_perm = X_test_perm[common_features]
+                        
+                        # Fit real model
+                        real_model = fit_elastic_net_cv(X_train_perm, y_train_perm, random_state=42)
+                        real_pred = real_model.predict(X_test_perm.values)
+                        real_r2 = corr_r2(y_test_perm.values, real_pred)
+                        
+                        # Run permutations
+                        perm_r2 = []
+                        rng = np.random.default_rng(42)
+                        
+                        # Check if we can do grouped shuffle
+                        groups = None
+                        if "competition_id" in temporal_train.columns:
+                            # Align groups with X_train_perm indices
+                            groups = temporal_train.loc[X_train_perm.index, "competition_id"]
+                        
+                        for i in range(n_perm):
+                            seed = int(rng.integers(1_000_000_000))
+                            
+                            # Shuffle target
+                            if groups is not None:
+                                y_perm = shuffle_within_groups(y_train_perm, groups, seed)
+                            else:
+                                # Global shuffle - create permuted series with same index
+                                y_perm_values = rng.permutation(y_train_perm.values)
+                                y_perm = pd.Series(y_perm_values, index=y_train_perm.index, name=y_train_perm.name)
+                            
+                            # Fit and predict
+                            m = fit_elastic_net_cv(X_train_perm, y_perm, random_state=42)
+                            pred = m.predict(X_test_perm.values)
+                            perm_r2.append(corr_r2(y_test_perm.values, pred))
+                        
+                        # Compute statistics
+                        perm_r2 = np.array([x for x in perm_r2 if not np.isnan(x)])
+                        p95 = float(np.percentile(perm_r2, 95)) if len(perm_r2) else np.nan
+                        pval = float((np.sum(perm_r2 >= real_r2) + 1) / (len(perm_r2) + 1)) if len(perm_r2) else np.nan
+                        
+                        # Store results
+                        st.session_state["perm_test_results"] = {
+                            "real_r2": float(real_r2),
+                            "perm_mean": float(np.mean(perm_r2)) if len(perm_r2) else np.nan,
+                            "perm_std": float(np.std(perm_r2)) if len(perm_r2) else np.nan,
+                            "perm_p95": p95,
+                            "perm_max": float(np.max(perm_r2)) if len(perm_r2) else np.nan,
+                            "perm_min": float(np.min(perm_r2)) if len(perm_r2) else np.nan,
+                            "p_value": pval,
+                            "n_perm": int(n_perm),
+                            "grouped": groups is not None,
+                        }
+                        st.success(f"✓ Permutation test completed ({n_perm} iterations)")
+                        
+                    except Exception as e:
+                        st.error(f"Permutation test failed: {e}")
+            
+            # Display results
+            res = st.session_state.get("perm_test_results")
+            if res:
+                st.subheader("📊 Results")
+                
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Real test R²", f"{res['real_r2']:.4f}")
+                c2.metric("Perm mean R²", f"{res['perm_mean']:.4f}")
+                c3.metric("Perm 95th pct", f"{res['perm_p95']:.4f}")
+                c4.metric("Empirical p-value", f"{res['p_value']:.4f}")
+                
+                st.caption(f"Shuffle type: {'Grouped by competition' if res['grouped'] else 'Global shuffle'}")
+                st.caption(f"Permutation range: [{res['perm_min']:.4f}, {res['perm_max']:.4f}] ± {res['perm_std']:.4f}")
+                
+                # Interpretation
+                if res["real_r2"] > res["perm_p95"]:
+                    st.success("✅ **Model beats chance** (real R² > 95th percentile of permuted models)")
+                    st.info(f"Real performance is {res['real_r2'] / res['perm_mean']:.2f}× better than shuffled-target baseline")
+                else:
+                    st.error("❌ **Model does NOT clearly beat chance** — suggests leakage, overfitting, or overly proximate features")
+                
+                if res["real_r2"] <= 0:
+                    st.warning("⚠️ Real R² ≤ 0 indicates no predictive signal or worse-than-naive performance")
     
     # ============================================
     # ABLATION EXPERIMENT (OPTIONAL)
