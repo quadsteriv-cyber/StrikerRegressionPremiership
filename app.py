@@ -477,12 +477,15 @@ def apply_common_filters(
     min_minutes: int,
     age_range: Tuple[int, int],
     league_filter: str,
+    specific_leagues: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     out = df.copy()
 
     # League filter - only apply if NOT "All Leagues"
     if "competition_id" in out.columns:
-        if league_filter == "Domestic Leagues":
+        if league_filter == "Custom Selection" and specific_leagues:
+            out = out[out["competition_id"].isin(specific_leagues)]
+        elif league_filter == "Domestic Leagues":
             out = out[out["competition_id"].isin(DOMESTIC_LEAGUE_IDS)]
         elif league_filter == "Scottish Leagues":
             out = out[out["competition_id"].isin(SCOTTISH_LEAGUE_IDS)]
@@ -758,7 +761,23 @@ def main():
 
         st.divider()
         st.header("2) Filters (applies to scouting pool)")
-        league_filter = st.selectbox("League Filter", ["All Leagues", "Domestic Leagues", "Scottish Leagues"], index=1)
+        league_filter = st.selectbox("League Filter", ["All Leagues", "Domestic Leagues", "Scottish Leagues", "Custom Selection"], index=1)
+        
+        # Custom league selection
+        specific_leagues = None
+        if league_filter == "Custom Selection":
+            available_leagues = {comp_id: LEAGUE_NAMES.get(comp_id, f"Comp {comp_id}") 
+                               for comp_id in COMPETITION_SEASONS.keys()}
+            selected_league_names = st.multiselect(
+                "Select specific leagues:",
+                options=sorted(available_leagues.values()),
+                default=["Premiership"],
+                help="Choose which leagues to include in scouting pool"
+            )
+            # Map back to competition IDs
+            name_to_id = {v: k for k, v in available_leagues.items()}
+            specific_leagues = [name_to_id[name] for name in selected_league_names]
+        
         min_minutes = st.slider("Minimum Minutes Played", 0, 3500, 900, 100)
         age_range = st.slider("Age Range", 16, 40, (18, 30))
         
@@ -924,6 +943,7 @@ def main():
         min_minutes=900,
         age_range=(18, 35),  # Training age range
         league_filter="All Leagues",  # Don't apply league filter, we already filtered by CANDIDATE_TRAINING_LEAGUE_IDS
+        specific_leagues=None,
     )
     
     # Check coverage per competition
@@ -1384,6 +1404,7 @@ def main():
         min_minutes=min_minutes,
         age_range=age_range,
         league_filter=league_filter,
+        specific_leagues=specific_leagues,
     )
     
     # Apply recruitment mode: exclude Scottish Premiership from scouting
