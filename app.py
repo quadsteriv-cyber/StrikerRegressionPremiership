@@ -31,7 +31,6 @@ from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import KFold
-from scipy.stats import spearmanr
 
 
 # -----------------------------
@@ -108,20 +107,6 @@ ST_POSITION_LABELS = {
 }
 
 PRIMARY_TARGET = "np_xg_90"  # after prefix stripping
-
-# ABLATION EXPERIMENT: Near-shot proxy features
-# These are NOT leakage - they're proximate predictors we test for dependence
-NEAR_SHOT_PROXY_FEATURES = {
-    "touches_inside_box_90",
-    "passes_into_box_90",
-    "passes_inside_box_90",
-    "sp_passes_into_box_90",
-    "op_passes_into_box_90",
-    "key_passes_90",
-    "op_key_passes_90",
-    "sp_key_passes_90",
-    "op_passes_into_and_touches_inside_box_90",
-}
 
 
 # -----------------------------
@@ -550,16 +535,11 @@ def build_feature_matrix(
     include_team_controls: bool = True,
     add_age_poly: bool = True,
     enable_league_fixed_effects: bool = False,
-    behaviour_only: bool = True,
-    allow_xg_identity: bool = False,
-    ablation_mode: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str], Dict]:
     """
     Builds X, y plus metadata: player_features, team_features, leakage_diagnostics
     - Player features: all numeric player columns excluding banned/leakage
     - Team controls: small list from get_team_control_columns()
-    - Ablation mode (optional): "M1_upstream_only" or "M2_near_shot_only" for experiments
-
     - League fixed effects (optional): one-hot encode competition_id to learn league-level differences
     - Leakage diagnostics: correlation analysis and dropped features
     """
@@ -576,130 +556,25 @@ def build_feature_matrix(
         "canonical_season",
     }
 
-    # ============================================
-    # BEHAVIOUR-ONLY GUARDRAILS
-    # ============================================
-    
-    # HARD EXCLUSIONS (ALWAYS applied, regardless of toggles)
-    hard_exclusion_patterns = [
-        # xG & derivatives
-        "xg", "npxg", "np_xg", "xg_per", "xg_90",
-        # outcomes / finishing
-        "goal", "goals", "npg", "npgoals",
-        "conversion", "shot_conversion",
-        # assists
-        "assist", "assists", "xa",
-        # defensive outcomes
-        "npga", "goals_against", "ga", "conceded",
-        # 🔴 SHOT IDENTITY LEAKAGE (np_xg_90 ≈ shots × shot_quality)
-        "shot", "shots",
-    ]
-    
-    hard_bans = {
+    # Leak / tautology bans (anything too close to outcome)
+    # We are modelling np_xg_90, so bans include np_xg itself (target), and goal/finishing variables.
+    bans = {
         target,
-        # Target aliases
-        "np_xg", "npxg", "np_xg_per_90", "npxg_90",
-        # Goal outcomes / finishing
-        "goals_90", "npg_90", "goals", "npg", "npgoals",
-        "conversion_ratio", "shot_on_target_ratio", "shot_conversion",
+        # Goal outcomes / finishing / conversion
+        "goals_90", "npg_90", "goals", "npg",
+        "conversion_ratio", "shot_on_target_ratio",
         "over_under_performance_90", "penalty_goals_90",
         "penalty_conversion_ratio",
-        # Assists
-        "assists", "xa", "xA", "expected_assists",
-        # Goals against / defensive outcomes
-        "npga", "npga_90", "goals_against", "ga", "conceded",
-        # Minutes (hard leakage)
-        "minutes", "player_season_minutes",
-        # 🔴 Shot-based features (identity leakage: np_xg ≈ shots × quality)
-        "np_shots_90", "shots_90", "shots", "shot",
-        "shot_touch_ratio", "shots_on_target", "shots_on_target_90",
-        # Other outcome proxies
+        # direct derived combos (if present)
         "shots_faced_90", "save_ratio",
     }
-    
-    def contains_hard_exclusion(col_name: str) -> bool:
-        """Check if column contains any hard exclusion pattern."""
-        col_lower = col_name.lower()
-        return any(pattern in col_lower for pattern in hard_exclusion_patterns)
-    
-    # BEHAVIOUR-ONLY WHITELIST (upstream actions only, NO outcomes)
-    allowed_player_behaviours = [
-        # Touches (upstream possession behaviours)
-        "touch", "touches_inside_box", "box_touch",
-        # NOTE: shot_touch_ratio REMOVED - it's outcome-derived
-        # NOTE: shots_, np_shots REMOVED - shot counts are outcomes
-        # Defensive actions
-        "press", "pressure", "counterpress",
-        # Ball progression
-        "carry", "dribble",
-        # Receiving
-        "receive", "receptions", "received",
-        # Passing
-        "pass", "key_pass", "passes_inside_box",
-        # Duels
-        "aerial", "duel",
-        # Other actions
-        "foul_won", "turnover",
-        # Movement/positioning
-        "distance", "average_x_pass",
-        # On-ball value (action-based, not outcome)
-        "obv",
-    ]
-    
-    allowed_team_patterns = [
-        "team_possession", "team_directness",
-        "team_passes_inside_box", "team_crosses_into_box",
-        "team_deep_completions", "team_field_tilt",
-        "team_",  # generic team context
-        "league_",  # league fixed effects
-    ]
-    
-    def is_allowed_behaviour(col_name: str) -> bool:
-        """Check if column matches allowed behaviour patterns."""
-        col_lower = col_name.lower()
-        # Check player behaviours
-        if any(pattern in col_lower for pattern in allowed_player_behaviours):
-            return True
-        # Check team patterns
-        if any(col_lower.startswith(pattern.lower()) or pattern.lower() in col_lower 
-               for pattern in allowed_team_patterns):
-            return True
-        return False
-    
-    # Get all numeric columns
+
+    # Numeric columns
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    
-    # Initial filtering: remove non-feature cols and hard bans
-    candidate_cols = [c for c in num_cols 
-                     if (c not in non_feature_cols) 
-                     and (c not in hard_bans)
-                     and (not contains_hard_exclusion(c))]
-    
-    # Separate player and team columns
-    player_candidates = [c for c in candidate_cols if not c.startswith("team_") and not c.startswith("league_")]
-    team_candidates = [c for c in candidate_cols if c.startswith("team_") or c.startswith("league_")]
-    
-    # Apply behaviour-only filter if enabled
-    dropped_by_behaviour_filter = []
-    if behaviour_only:
-        player_num = [c for c in player_candidates if is_allowed_behaviour(c)]
-        dropped_by_behaviour_filter = [c for c in player_candidates if not is_allowed_behaviour(c)]
-        
-        # Team controls: keep if allowed OR if include_team_controls
-        if include_team_controls:
-            team_cols = team_candidates  # Keep all team controls
-        else:
-            team_cols = []
-    else:
-        player_num = player_candidates
-        team_cols = team_candidates if include_team_controls else []
-    
-    # Track filtering stats
-    total_numeric = len(num_cols)
-    after_hard_exclusions = len(candidate_cols)
-    after_behaviour_filter = len(player_num) + len(team_cols)
-    
-    # Build initial X
+    player_num = [c for c in num_cols if (c not in non_feature_cols) and (not c.startswith("team_")) and (c not in bans)]
+
+    team_cols = get_team_control_columns(df) if include_team_controls else []
+
     X = df[player_num + team_cols].copy()
 
     # Age controls
@@ -744,22 +619,13 @@ def build_feature_matrix(
             X[c] = X[c].fillna(X[c].median())
     
     # ============================================
-    # LEAKAGE DIAGNOSTICS & CORRELATION-BASED GUARDRAIL
+    # LEAKAGE DIAGNOSTICS
     # ============================================
     leakage_diagnostics = {
         "correlations": {},
         "exact_matches": [],
-        "dropped_high_corr": [],
         "dropped_features": [],
-        "leaky_features": [],
-        "guardrail_stats": {
-            "total_numeric": total_numeric,
-            "after_hard_exclusions": after_hard_exclusions,
-            "after_behaviour_filter": after_behaviour_filter,
-            "final_feature_count": 0,  # Will update after drops
-        },
-        "dropped_by_behaviour": dropped_by_behaviour_filter[:50],  # First 50
-        "kept_features": list(X.columns)[:50],  # Will update after drops
+        "leaky_features": []
     }
     
     # Compute correlation of each feature with target
@@ -784,18 +650,17 @@ def build_feature_matrix(
         except Exception:
             pass
     
-    # Identify highly correlated features (>0.95) - ALWAYS drop these
+    # Identify highly correlated features (suspicious)
     corr_series = pd.Series(correlations)
-    high_corr_features = corr_series[corr_series.abs() > 0.95].index.tolist()
+    leaky_features = corr_series[corr_series.abs() > 0.95].index.tolist()
     
     # Store diagnostics
     leakage_diagnostics["correlations"] = correlations
     leakage_diagnostics["exact_matches"] = exact_matches
-    leakage_diagnostics["leaky_features"] = high_corr_features
-    leakage_diagnostics["dropped_high_corr"] = high_corr_features
+    leakage_diagnostics["leaky_features"] = leaky_features
     
     # Determine which columns to drop
-    drop_cols = set(exact_matches) | set(high_corr_features)
+    drop_cols = set(exact_matches) | set(leaky_features)
     
     if drop_cols:
         leakage_diagnostics["dropped_features"] = list(drop_cols)
@@ -805,40 +670,6 @@ def build_feature_matrix(
         # Update feature lists
         player_features = [f for f in player_features if f not in drop_cols]
         team_features = [f for f in team_features if f not in drop_cols]
-    else:
-        leakage_diagnostics["dropped_features"] = []
-    
-    # Update final stats
-    leakage_diagnostics["guardrail_stats"]["final_feature_count"] = len(X.columns)
-    leakage_diagnostics["kept_features"] = list(X.columns)[:50]  # First 50 kept
-    
-    # ============================================
-    # ABLATION MODE (EXPERIMENT ONLY - non-breaking)
-    # ============================================
-    if ablation_mode is not None:
-        # Identify control columns (age, team, league FE) - keep these regardless
-        control_cols = []
-        if "age" in X.columns:
-            control_cols.append("age")
-        if "age_sq" in X.columns:
-            control_cols.append("age_sq")
-        control_cols.extend([c for c in X.columns if c.startswith("team_") or c.startswith("league_")])
-        
-        if ablation_mode == "M1_upstream_only":
-            # Drop near-shot proxy features, keep everything else
-            drop_near_shot = [c for c in X.columns if c in NEAR_SHOT_PROXY_FEATURES]
-            if drop_near_shot:
-                X = X.drop(columns=drop_near_shot)
-                player_features = [f for f in player_features if f not in NEAR_SHOT_PROXY_FEATURES]
-                leakage_diagnostics["ablation_dropped"] = drop_near_shot
-        
-        elif ablation_mode == "M2_near_shot_only":
-            # Keep ONLY near-shot proxies + controls
-            keep_cols = control_cols + [c for c in X.columns if c in NEAR_SHOT_PROXY_FEATURES]
-            keep_cols = list(set(keep_cols))  # dedupe
-            X = X[keep_cols]
-            player_features = [f for f in player_features if f in NEAR_SHOT_PROXY_FEATURES]
-            leakage_diagnostics["ablation_kept_only"] = keep_cols
 
     return X, y, player_features, team_features, leakage_diagnostics
 
@@ -911,153 +742,6 @@ def stability_selection(
     return out
 
 
-def shuffle_within_groups(y: pd.Series, groups: pd.Series, seed: int) -> pd.Series:
-    """Shuffle target values within each group (e.g., competition_id) to preserve league structure."""
-    rng = np.random.default_rng(seed)
-    y_perm = y.copy()
-    for g, idx in groups.groupby(groups).groups.items():
-        vals = y.loc[idx].values
-        rng.shuffle(vals)
-        y_perm.loc[idx] = vals
-    return y_perm
-
-
-def corr_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute R² as correlation squared (consistent with existing approach)."""
-    if len(y_true) < 2:
-        return np.nan
-    r = np.corrcoef(y_true, y_pred)[0, 1]
-    if np.isnan(r):
-        return np.nan
-    return float(r ** 2)
-
-
-def run_ablation_experiment(
-    train_data: pd.DataFrame,
-    test_data: pd.DataFrame,
-    scouting_data: pd.DataFrame,
-    target: str,
-    include_team_controls: bool,
-    add_age_poly: bool,
-    enable_league_fe: bool,
-    behaviour_only: bool,
-    allow_xg_identity: bool,
-    run_shuffle_test: bool = False,
-) -> Dict:
-    """
-    Run ablation experiment comparing M0 (baseline), M1 (upstream-only), M2 (near-shot only).
-    
-    Returns dict with:
-    - "models": {mode: trained_model}
-    - "metrics": {mode: {"r2_test": float, "mae_test": float, "features": List[str]}}
-    - "predictions": {mode: {"test": np.array, "scouting": np.array}}
-    - "shuffle_metrics": (if run_shuffle_test) {mode: {"r2_test": float, "mae_test": float}}
-    """
-    results = {
-        "models": {},
-        "metrics": {},
-        "predictions": {},
-        "feature_lists": {},
-    }
-    
-    modes = ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]
-    
-    for mode in modes:
-        # Extract ablation mode suffix
-        ablation_mode = mode if mode != "M0_baseline" else None
-        
-        # Build feature matrices
-        X_train, y_train, _, _, _ = build_feature_matrix(
-            train_data, target, include_team_controls, add_age_poly, enable_league_fe, 
-            behaviour_only, allow_xg_identity, ablation_mode=ablation_mode
-        )
-        X_test, y_test, _, _, _ = build_feature_matrix(
-            test_data, target, include_team_controls, add_age_poly, enable_league_fe,
-            behaviour_only, allow_xg_identity, ablation_mode=ablation_mode
-        )
-        X_scouting, _, _, _, _ = build_feature_matrix(
-            scouting_data, target, include_team_controls, add_age_poly, enable_league_fe,
-            behaviour_only, allow_xg_identity, ablation_mode=ablation_mode
-        )
-        
-        # Align features
-        common_features = list(set(X_train.columns) & set(X_test.columns) & set(X_scouting.columns))
-        X_train = X_train[common_features]
-        X_test = X_test[common_features]
-        X_scouting = X_scouting[common_features]
-        
-        # Train model
-        model = fit_elastic_net_cv(X_train, y_train, random_state=42)
-        
-        # Predictions
-        y_test_pred = model.predict(X_test.values)
-        y_scouting_pred = model.predict(X_scouting.values)
-        
-        # Metrics
-        corr_test = np.corrcoef(y_test.values, y_test_pred)[0, 1]
-        r2_test = corr_test ** 2 if not np.isnan(corr_test) else 0.0
-        mae_test = float(np.mean(np.abs(y_test.values - y_test_pred)))
-        
-        # Store results
-        results["models"][mode] = model
-        results["metrics"][mode] = {
-            "r2_test": r2_test,
-            "mae_test": mae_test,
-            "n_features": len(common_features),
-            "n_nonzero": int(np.sum(model.named_steps["enet"].coef_ != 0)),
-        }
-        results["predictions"][mode] = {
-            "test": y_test_pred,
-            "scouting": y_scouting_pred,
-        }
-        results["feature_lists"][mode] = common_features
-        
-        # Shuffle sanity test (should yield ~zero performance)
-        if run_shuffle_test:
-            if "shuffle_metrics" not in results:
-                results["shuffle_metrics"] = {}
-            
-            rng = np.random.default_rng(42)
-            y_train_shuffled = y_train.copy()
-            y_train_shuffled.iloc[:] = rng.permutation(y_train_shuffled.values)
-            
-            shuffle_model = fit_elastic_net_cv(X_train, y_train_shuffled, random_state=43)
-            y_test_shuffle_pred = shuffle_model.predict(X_test.values)
-            
-            corr_shuffle = np.corrcoef(y_test.values, y_test_shuffle_pred)[0, 1]
-            r2_shuffle = corr_shuffle ** 2 if not np.isnan(corr_shuffle) else 0.0
-            mae_shuffle = float(np.mean(np.abs(y_test.values - y_test_shuffle_pred)))
-            
-            results["shuffle_metrics"][mode] = {
-                "r2_test": r2_shuffle,
-                "mae_test": mae_shuffle,
-            }
-    
-    # Compute dependence diagnostics (correlations between model predictions)
-    results["dependence"] = {}
-    for m1 in modes:
-        for m2 in modes:
-            if m1 < m2:  # Avoid duplicate pairs
-                pred1 = results["predictions"][m1]["scouting"]
-                pred2 = results["predictions"][m2]["scouting"]
-                
-                # Spearman rank correlation
-                from scipy.stats import spearmanr
-                rho, _ = spearmanr(pred1, pred2)
-                
-                # Top-30 overlap
-                top30_m1 = set(np.argsort(-pred1)[:30])
-                top30_m2 = set(np.argsort(-pred2)[:30])
-                overlap = len(top30_m1 & top30_m2)
-                
-                results["dependence"][f"{m1}_vs_{m2}"] = {
-                    "spearman": float(rho),
-                    "top30_overlap": overlap,
-                }
-    
-    return results
-
-
 # -----------------------------
 # 5) Streamlit UI
 # -----------------------------
@@ -1067,30 +751,9 @@ def main():
     st.title("SPFL Striker Chance-Generation Drivers (StatsBomb IQ season stats)")
 
     with st.sidebar:
-        # DIAGNOSTICS: Confirm which file is running
-        import os
-        st.caption(f"RUNNING FILE: {os.path.abspath(__file__)}")
-        st.caption(f"BOOT TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        st.error("✅ NEW CODE LOADED - Jan 9 2026")
-        
-        # Hard cache reset
-        if st.button("🔄 HARD CLEAR CACHE"):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.session_state.clear()
-            st.rerun()
-        
-        st.divider()
         st.header("1) StatsBomb Credentials")
-        try:
-            default_user = st.secrets.get("STATS_BOMB_USER", "")
-            default_pass = st.secrets.get("STATS_BOMB_PASS", "")
-        except:
-            default_user = ""
-            default_pass = ""
-        
-        sb_user = st.text_input("Username", value=default_user, type="default")
-        sb_pass = st.text_input("Password", value=default_pass, type="password")
+        sb_user = st.text_input("Username", value=st.secrets.get("STATS_BOMB_USER", ""), type="default")
+        sb_pass = st.text_input("Password", value=st.secrets.get("STATS_BOMB_PASS", ""), type="password")
         auth = (sb_user, sb_pass)
 
         st.divider()
@@ -1120,29 +783,9 @@ def main():
             season_filter = None
 
         st.divider()
-        st.header("3) Experiment Mode TEST")
-        experiment_mode = st.checkbox("Enable Experiment Mode", value=False)
-        run_experiment_btn = False
-        run_shuffle_test = False
-        experiment_config = "(M0) Baseline (current model)"
-        
-        st.divider()
-        st.header("4) Model Settings")
+        st.header("3) Model Settings")
         include_team_controls = st.checkbox("Include team-season controls (recommended)", value=True)
         add_age_poly = st.checkbox("Use age + age² (recommended)", value=True)
-        
-        st.divider()
-        behaviour_only = st.checkbox("✅ Behaviour-only features (recommended)",
-                                    value=True,
-                                    help="Strict whitelist: only upstream player actions (touches, receptions, carries, pressures, aerials, etc.) + team context")
-        
-        allow_xg_identity = st.checkbox("⚠️ Allow xG-derived predictors (identity risk)",
-                                       value=False,
-                                       help="When OFF: excludes xG, npxg, shots_90, etc. Model uses only upstream behaviours.")
-        if not behaviour_only:
-            st.warning("⚠️ Behaviour-only filter is OFF - model may use outcome-contaminated features")
-        elif not allow_xg_identity:
-            st.caption("🛡️ Model restricted to upstream behavioural features (touches, receptions, carries, pressures, aerials, etc.)")
 
         n_boot = st.slider("Stability selection bootstraps", 30, 300, 120, 10)
         sample_frac = st.slider("Bootstrap sample fraction", 0.50, 1.00, 0.85, 0.05)
@@ -1150,7 +793,7 @@ def main():
         top_k = st.slider("Show Top-K predictors", 3, 20, 5, 1)
         
         st.divider()
-        st.header("5) Output Settings")
+        st.header("4) Output Settings")
         sort_by = st.selectbox("Sort shortlist by", ["pred_np_xg_90", "pred_goals_90_avg_finish", "residual"], index=0,
                               help="pred_goals_90_avg_finish assumes league-average finishing (multiplier=1.0)")
         
@@ -1159,7 +802,7 @@ def main():
                                        help="Bootstrap prediction intervals - may take 30-60 seconds")
         
         st.divider()
-        st.header("6) League Adjustments (Advanced)")
+        st.header("5) League Adjustments (Advanced)")
         enable_league_fe = st.checkbox("⚙️ Learn league fixed effects",
                                        value=False,
                                        help="Add one-hot competition features - may improve fit but reduces interpretability")
@@ -1168,7 +811,7 @@ def main():
         load_btn = st.button("Load / Refresh Data", type="primary")
 
     # Check if model settings changed (requires refit)
-    model_settings_key = f"{include_team_controls}_{add_age_poly}_{enable_league_fe}_{behaviour_only}_{allow_xg_identity}_{n_boot}_{sample_frac}"
+    model_settings_key = f"{include_team_controls}_{add_age_poly}_{n_boot}_{sample_frac}"
     model_settings_changed = st.session_state.get("model_settings_key") != model_settings_key
     
     # Persist data in session state
@@ -1335,9 +978,6 @@ def main():
                 target=PRIMARY_TARGET,
                 include_team_controls=include_team_controls,
                 add_age_poly=add_age_poly,
-                enable_league_fixed_effects=enable_league_fe,
-                behaviour_only=behaviour_only,
-                allow_xg_identity=allow_xg_identity,
             )
         except Exception as e:
             st.error(f"Feature matrix build failed: {e}")
@@ -1420,46 +1060,27 @@ def main():
             trait_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
             control_rows = pd.DataFrame(columns=["feature", "selection_freq", "mean_abs_coef"])
         
-        # PHASE 3: Training residual diagnostics (FULL PRECISION)
+        # Training residual diagnostics (sanity check for leakage)
         yhat_train = full_model.predict(X.values)
-        residuals_train = y.values - yhat_train  # Full precision, no rounding
+        residuals_train = y.values - yhat_train
         train_residual_stats = {
             "min": float(residuals_train.min()),
             "max": float(residuals_train.max()),
             "mean": float(residuals_train.mean()),
-            "std": float(residuals_train.std(ddof=1)),  # Sample std
-            "mean_abs": float(np.mean(np.abs(residuals_train))),
-            "max_abs": float(np.max(np.abs(residuals_train))),
+            "std": float(residuals_train.std(ddof=0)),
             "unique": int(pd.Series(residuals_train).nunique()),
             "all_zero": bool(np.allclose(residuals_train, 0, atol=1e-10))
         }
         
-        # PHASE 4: Expected behaviour check
-        if train_residual_stats["std"] < 1e-3:
-            st.error("""
-            🚨 **CRITICAL WARNING**: Residual variance is extremely small (<0.001).
-            
-            The model may still be reconstructing the target from its own accounting components
-            rather than predicting from upstream behaviours. 
-            
-            **Action**: Ensure xG-identity filter is enabled (checkbox should be OFF).
-            """)
-        
-        with st.expander("📊 Residual Diagnostics", expanded=(train_residual_stats["std"] < 0.01)):
-            st.write("**Residual statistics on training set (FULL PRECISION):**")
-            # Display with 6 decimal precision
-            display_stats = {k: f"{v:.6f}" if isinstance(v, float) else v 
-                           for k, v in train_residual_stats.items()}
-            st.json(display_stats)
-            
+        with st.expander("📊 Training Residual Diagnostics"):
+            st.write("Residual statistics on training set:")
+            st.json(train_residual_stats)
             if train_residual_stats["all_zero"]:
                 st.error("⚠️ All training residuals are ~0! This indicates perfect fit (likely leakage).")
             elif train_residual_stats["std"] < 0.01:
-                st.warning("⚠️ Very low residual variance - possible leakage or identity reconstruction.")
-            elif train_residual_stats["std"] < 0.05:
-                st.info("ℹ️ Residual std is small but non-trivial. Model may have some predictive signal.")
+                st.warning("⚠️ Very low residual variance - possible leakage.")
             else:
-                st.success(f"✓ Training residuals show normal variation (std={train_residual_stats['std']:.4f})")
+                st.success("✓ Training residuals show normal variation.")
         
         # Cache everything
         st.session_state.full_model = full_model
@@ -1471,8 +1092,6 @@ def main():
         st.session_state.trait_rows = trait_rows
         st.session_state.control_rows = control_rows
         st.session_state.model_settings_key = model_settings_key
-        st.session_state.leakage_diag = leakage_diag  # Cache for diagnostics
-        st.session_state.train_base = train_base  # Cache training data for experiments
     else:
         # Use cached model
         full_model = st.session_state.full_model
@@ -1483,107 +1102,6 @@ def main():
         team_feats = st.session_state.team_feats
         trait_rows = st.session_state.trait_rows
         control_rows = st.session_state.control_rows
-        leakage_diag = st.session_state.leakage_diag
-    
-    # ============================================
-    # FEATURE GUARDRAIL REPORT
-    # ============================================
-    with st.expander("🛡️ Feature Guardrail Report", expanded=behaviour_only):
-        st.markdown("**Purpose**: Show how behaviour-only filtering and hard exclusions protect against outcome leakage")
-        
-        guardrail_stats = leakage_diag.get("guardrail_stats", {})
-        
-        # Counts
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total numeric cols", guardrail_stats.get("total_numeric", 0))
-        with col2:
-            st.metric("After hard exclusions", guardrail_stats.get("after_hard_exclusions", 0))
-        with col3:
-            st.metric("After behaviour filter", guardrail_stats.get("after_behaviour_filter", 0))
-        with col4:
-            st.metric("Final (post-corr drop)", guardrail_stats.get("final_feature_count", 0))
-        
-        # Dropped by behaviour filter
-        dropped_by_behaviour = leakage_diag.get("dropped_by_behaviour", [])
-        if dropped_by_behaviour and behaviour_only:
-            st.subheader("🚫 Dropped by behaviour-only filter")
-            st.caption(f"Showing first {len(dropped_by_behaviour)} of dropped features")
-            st.write(dropped_by_behaviour)
-        
-        # Dropped by correlation
-        dropped_high_corr = leakage_diag.get("dropped_high_corr", [])
-        if dropped_high_corr:
-            st.subheader("⚠️ Dropped due to high correlation (|r| > 0.95)")
-            st.write(dropped_high_corr)
-        
-        # Kept features
-        kept_features = leakage_diag.get("kept_features", [])
-        if kept_features:
-            st.subheader("✅ Kept features (first 50)")
-            st.write(kept_features)
-        
-        if behaviour_only:
-            st.success("✓ Behaviour-only filter is ACTIVE - only upstream player actions + team context allowed")
-        else:
-            st.warning("⚠️ Behaviour-only filter is OFF - may include outcome-contaminated features")
-    
-    # ============================================
-    # PHASE 0: TAUTOLOGY DIAGNOSTICS
-    # ============================================
-    with st.expander("🧮 Tautology Diagnostics (Is target reconstructible?)", expanded=False):
-        st.markdown("""
-        **Purpose**: Detect if model is reconstructing np_xg_90 from its own accounting components
-        rather than predicting from upstream striker behaviours.
-        """)
-        
-        # 1) TOP COEFFICIENTS
-        st.subheader("1️⃣ Top Coefficients")
-        try:
-            enet_model = full_model.named_steps["enet"]
-            coefs = enet_model.coef_
-            coef_df = pd.DataFrame({
-                "feature": all_features,
-                "coef": coefs,
-                "abs_coef": np.abs(coefs)
-            }).sort_values("abs_coef", ascending=False).head(20)
-            st.dataframe(coef_df, width=700, hide_index=True)
-            
-            # Check for outcome-contaminated features in top coefficients
-            outcome_patterns = ["goals", "npg", "assists", "xa", "npga", "conversion"]
-            top_features = coef_df["feature"].head(20).tolist()
-            contaminated = [f for f in top_features 
-                          if any(pattern in f.lower() for pattern in outcome_patterns)]
-            if contaminated:
-                st.error(f"⚠️ Outcome-contaminated features in top coefficients: {contaminated}")
-            else:
-                st.success("✓ No obvious outcome features in top coefficients")
-        except Exception as e:
-            st.error(f"Could not extract coefficients: {e}")
-        
-        # 2) CORRELATION-BASED LEAKAGE CHECK
-        st.subheader("2️⃣ Correlation-Based Leakage Check")
-        high_corr = leakage_diag.get("dropped_high_corr", [])
-        if high_corr:
-            st.error(f"⚠️ {len(high_corr)} features auto-dropped for |correlation| > 0.95")
-            st.write(high_corr[:30])
-        else:
-            st.success("✓ No features with suspicious correlation (>0.95) to target")
-        
-        # 3) IDENTITY RECONSTRUCTION TEST
-        st.subheader("3️⃣ Residual Variance Check")
-        residuals_train = y.values - full_model.predict(X.values)
-        resid_std = float(np.std(residuals_train, ddof=1))
-        st.metric("Training residual std", f"{resid_std:.6f}")
-        
-        if resid_std < 0.001:
-            st.error("🚨 CRITICAL: Residual std < 0.001 - model is reconstructing target!")
-        elif resid_std < 0.01:
-            st.warning("⚠️ Very small residual std - possible identity leakage")
-        elif resid_std < 0.05:
-            st.info("ℹ️ Small but non-trivial residual variance")
-        else:
-            st.success(f"✓ Healthy residual variance - model uses upstream behaviours")
     
     # ============================================
     # PHASE 2: TEMPORAL VALIDATION
@@ -1646,10 +1164,10 @@ def main():
                 
                 try:
                     X_temp_train, y_temp_train, _, _, _ = build_feature_matrix(
-                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
+                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly
                     )
                     X_temp_test, y_temp_test, _, _, _ = build_feature_matrix(
-                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
+                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly
                     )
                     
                     # Align features
@@ -1724,10 +1242,10 @@ def main():
                 try:
                     # Build feature matrices
                     X_cross_train, y_cross_train, _, _, _ = build_feature_matrix(
-                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
+                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly
                     )
                     X_cross_test, y_cross_test, _, _, _ = build_feature_matrix(
-                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
+                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly
                     )
                     
                     # Align features
@@ -1759,269 +1277,6 @@ def main():
                     
                 except Exception as e:
                     st.error(f"Cross-league test failed: {e}")
-    
-    # ============================================
-    # PERMUTATION TEST (EXPERIMENT MODE ONLY)
-    # ============================================
-    st.write(f"DEBUG: experiment_mode = {experiment_mode}")  # DIAGNOSTIC
-    if experiment_mode:
-        st.subheader("🧪 PERMUTATION TEST SECTION RENDERED")  # DIAGNOSTIC
-        with st.expander("🧪 Permutation Test (Shuffle Test)", expanded=False):
-            st.markdown("""
-            **Purpose**: Test if the model beats chance by comparing real test R² against permuted-target models.
-            
-            - Shuffles target within competition groups (preserves league structure)
-            - Fits model on shuffled data and tests on real test set
-            - If real R² > 95th percentile of permuted R², model beats chance
-            """)
-            
-            n_perm = st.slider("Number of permutations", 20, 200, 50, 10, key="n_perm_slider")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                run_perm_btn = st.button("▶️ Run Permutation Test", key="run_perm_btn")
-            with col2:
-                if st.button("🔄 Clear Results", key="clear_perm_btn"):
-                    if "perm_test_results" in st.session_state:
-                        del st.session_state["perm_test_results"]
-                    st.success("Permutation results cleared")
-            
-            if run_perm_btn:
-                with st.spinner(f"Running {n_perm} permutations..."):
-                    try:
-                        # Use train_base (the SPFL training data)
-                        if "train_base" not in st.session_state or st.session_state.get("train_base") is None:
-                            st.error("No training data available. Please load data first.")
-                            return
-                        
-                        train_data_perm = st.session_state["train_base"]
-                        
-                        # Prepare temporal train/test split
-                        if "canonical_season" in train_data_perm.columns:
-                            train_sorted = train_data_perm.sort_values("canonical_season")
-                            n_train = len(train_sorted)
-                            split_idx = max(int(0.7 * n_train), 10)
-                            temporal_train = train_sorted.iloc[:split_idx]
-                            temporal_test = train_sorted.iloc[split_idx:]
-                        else:
-                            from sklearn.model_selection import train_test_split
-                            temporal_train, temporal_test = train_test_split(train_data_perm, test_size=0.3, random_state=42)
-                        
-                        # Build feature matrices
-                        X_train_perm, y_train_perm, _, _, _ = build_feature_matrix(
-                            temporal_train, PRIMARY_TARGET, include_team_controls, add_age_poly, 
-                            enable_league_fe, behaviour_only, allow_xg_identity
-                        )
-                        X_test_perm, y_test_perm, _, _, _ = build_feature_matrix(
-                            temporal_test, PRIMARY_TARGET, include_team_controls, add_age_poly,
-                            enable_league_fe, behaviour_only, allow_xg_identity
-                        )
-                        
-                        # Align features
-                        common_features = list(set(X_train_perm.columns) & set(X_test_perm.columns))
-                        X_train_perm = X_train_perm[common_features]
-                        X_test_perm = X_test_perm[common_features]
-                        
-                        # Fit real model
-                        real_model = fit_elastic_net_cv(X_train_perm, y_train_perm, random_state=42)
-                        real_pred = real_model.predict(X_test_perm.values)
-                        real_r2 = corr_r2(y_test_perm.values, real_pred)
-                        
-                        # Run permutations
-                        perm_r2 = []
-                        rng = np.random.default_rng(42)
-                        
-                        # Check if we can do grouped shuffle
-                        groups = None
-                        if "competition_id" in temporal_train.columns:
-                            # Align groups with X_train_perm indices
-                            groups = temporal_train.loc[X_train_perm.index, "competition_id"]
-                        
-                        for i in range(n_perm):
-                            seed = int(rng.integers(1_000_000_000))
-                            
-                            # Shuffle target
-                            if groups is not None:
-                                y_perm = shuffle_within_groups(y_train_perm, groups, seed)
-                            else:
-                                # Global shuffle - create permuted series with same index
-                                y_perm_values = rng.permutation(y_train_perm.values)
-                                y_perm = pd.Series(y_perm_values, index=y_train_perm.index, name=y_train_perm.name)
-                            
-                            # Fit and predict
-                            m = fit_elastic_net_cv(X_train_perm, y_perm, random_state=42)
-                            pred = m.predict(X_test_perm.values)
-                            perm_r2.append(corr_r2(y_test_perm.values, pred))
-                        
-                        # Compute statistics
-                        perm_r2 = np.array([x for x in perm_r2 if not np.isnan(x)])
-                        p95 = float(np.percentile(perm_r2, 95)) if len(perm_r2) else np.nan
-                        pval = float((np.sum(perm_r2 >= real_r2) + 1) / (len(perm_r2) + 1)) if len(perm_r2) else np.nan
-                        
-                        # Store results
-                        st.session_state["perm_test_results"] = {
-                            "real_r2": float(real_r2),
-                            "perm_mean": float(np.mean(perm_r2)) if len(perm_r2) else np.nan,
-                            "perm_std": float(np.std(perm_r2)) if len(perm_r2) else np.nan,
-                            "perm_p95": p95,
-                            "perm_max": float(np.max(perm_r2)) if len(perm_r2) else np.nan,
-                            "perm_min": float(np.min(perm_r2)) if len(perm_r2) else np.nan,
-                            "p_value": pval,
-                            "n_perm": int(n_perm),
-                            "grouped": groups is not None,
-                        }
-                        st.success(f"✓ Permutation test completed ({n_perm} iterations)")
-                        
-                    except Exception as e:
-                        st.error(f"Permutation test failed: {e}")
-            
-            # Display results
-            res = st.session_state.get("perm_test_results")
-            if res:
-                st.subheader("📊 Results")
-                
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Real test R²", f"{res['real_r2']:.4f}")
-                c2.metric("Perm mean R²", f"{res['perm_mean']:.4f}")
-                c3.metric("Perm 95th pct", f"{res['perm_p95']:.4f}")
-                c4.metric("Empirical p-value", f"{res['p_value']:.4f}")
-                
-                st.caption(f"Shuffle type: {'Grouped by competition' if res['grouped'] else 'Global shuffle'}")
-                st.caption(f"Permutation range: [{res['perm_min']:.4f}, {res['perm_max']:.4f}] ± {res['perm_std']:.4f}")
-                
-                # Interpretation
-                if res["real_r2"] > res["perm_p95"]:
-                    st.success("✅ **Model beats chance** (real R² > 95th percentile of permuted models)")
-                    st.info(f"Real performance is {res['real_r2'] / res['perm_mean']:.2f}× better than shuffled-target baseline")
-                else:
-                    st.error("❌ **Model does NOT clearly beat chance** — suggests leakage, overfitting, or overly proximate features")
-                
-                if res["real_r2"] <= 0:
-                    st.warning("⚠️ Real R² ≤ 0 indicates no predictive signal or worse-than-naive performance")
-    
-    # ============================================
-    # ABLATION EXPERIMENT (OPTIONAL)
-    # ============================================
-    if experiment_mode and run_experiment_btn:
-        with st.spinner("Running ablation experiment (M0, M1, M2)..."):
-            try:
-                # Use train_base from session_state
-                if "train_base" not in st.session_state:
-                    st.error("No training data available. Please load data first.")
-                else:
-                    train_data_abl = st.session_state["train_base"]
-                    
-                    # Prepare train/test split for temporal validation
-                    if "canonical_season" in train_data_abl.columns:
-                        train_sorted = train_data_abl.sort_values("canonical_season")
-                        n_train = len(train_sorted)
-                        split_idx = max(int(0.7 * n_train), 10)
-                        temporal_train = train_sorted.iloc[:split_idx]
-                        temporal_test = train_sorted.iloc[split_idx:]
-                    else:
-                        # Fallback: random 70/30 split
-                        from sklearn.model_selection import train_test_split
-                        temporal_train, temporal_test = train_test_split(train_data_abl, test_size=0.3, random_state=42)
-                
-                # Run experiment
-                experiment_results = run_ablation_experiment(
-                    train_data=temporal_train,
-                    test_data=temporal_test,
-                    scouting_data=scouting,
-                    target=PRIMARY_TARGET,
-                    include_team_controls=include_team_controls,
-                    add_age_poly=add_age_poly,
-                    enable_league_fe=enable_league_fe,
-                    behaviour_only=behaviour_only,
-                    allow_xg_identity=allow_xg_identity,
-                    run_shuffle_test=run_shuffle_test,
-                )
-                
-                # Cache results
-                st.session_state["ablation_results"] = experiment_results
-                st.success("✓ Experiment completed")
-                
-            except Exception as e:
-                st.error(f"Experiment failed: {e}")
-    
-    # Display experiment results (if available)
-    if experiment_mode and "ablation_results" in st.session_state:
-        with st.expander("🔬 Ablation Experiment Results", expanded=True):
-            results = st.session_state["ablation_results"]
-            
-            st.markdown("""
-            **Test:** Does model performance depend on near-shot proxy features vs upstream behaviours?
-            
-            - **M0 (Baseline)**: All behaviour features (current model)
-            - **M1 (Upstream-only)**: Removes near-shot proxies (touches_inside_box, passes_into_box, etc.)
-            - **M2 (Near-shot only)**: Keeps only near-shot proxies + controls (age, team, league)
-            """)
-            
-            # Metrics comparison table
-            st.subheader("📊 Test Set Performance")
-            metrics_df = pd.DataFrame({
-                "Model": ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"],
-                "R²": [results["metrics"][m]["r2_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
-                "MAE": [results["metrics"][m]["mae_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
-                "Features": [results["metrics"][m]["n_features"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
-                "Non-zero": [results["metrics"][m]["n_nonzero"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
-            })
-            st.dataframe(metrics_df.style.format({"R²": "{:.4f}", "MAE": "{:.4f}"}), width="stretch", hide_index=True)
-            
-            # Interpretation
-            r2_m0 = results["metrics"]["M0_baseline"]["r2_test"]
-            r2_m1 = results["metrics"]["M1_upstream_only"]["r2_test"]
-            r2_m2 = results["metrics"]["M2_near_shot_only"]["r2_test"]
-            
-            if r2_m2 > r2_m1 * 1.5:
-                st.warning("⚠️ Performance heavily depends on near-shot proxies - model may be learning shot generation rather than upstream behaviours")
-            elif r2_m1 > r2_m2:
-                st.success("✓ Upstream behaviours provide stronger signal than near-shot proxies - defensible behaviour-only model")
-            else:
-                st.info("ℹ️ Mixed signal - both upstream and near-shot features contribute")
-            
-            # Dependence diagnostics
-            st.subheader("🔗 Model Agreement Diagnostics")
-            st.caption("How similar are the model rankings?")
-            
-            dep_df = []
-            for key, vals in results["dependence"].items():
-                m1, m2 = key.split("_vs_")
-                dep_df.append({
-                    "Comparison": f"{m1} vs {m2}",
-                    "Spearman ρ": vals["spearman"],
-                    "Top-30 overlap": vals["top30_overlap"],
-                })
-            
-            dep_table = pd.DataFrame(dep_df)
-            st.dataframe(dep_table.style.format({"Spearman ρ": "{:.3f}"}), width="stretch", hide_index=True)
-            
-            if len(dep_df) > 0:
-                avg_spearman = np.mean([d["Spearman ρ"] for d in dep_df])
-                if avg_spearman < 0.5:
-                    st.error("❌ Low agreement between models - predictions are highly dependent on feature set choice")
-                elif avg_spearman < 0.8:
-                    st.warning("⚠️ Moderate agreement - feature set matters for ranking")
-                else:
-                    st.success("✓ High agreement - rankings are robust to feature set changes")
-            
-            # Shuffle sanity test
-            if run_shuffle_test and "shuffle_metrics" in results:
-                st.subheader("🎲 Shuffle Sanity Test")
-                st.caption("Training on shuffled target should yield ~zero test performance")
-                
-                shuffle_df = pd.DataFrame({
-                    "Model": ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"],
-                    "Shuffle R²": [results["shuffle_metrics"][m]["r2_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
-                    "Shuffle MAE": [results["shuffle_metrics"][m]["mae_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
-                })
-                st.dataframe(shuffle_df.style.format({"Shuffle R²": "{:.4f}", "Shuffle MAE": "{:.4f}"}), width="stretch", hide_index=True)
-                
-                max_shuffle_r2 = max([results["shuffle_metrics"][m]["r2_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]])
-                if max_shuffle_r2 > 0.05:
-                    st.error("🚨 Shuffle test shows non-trivial R² - possible data leakage!")
-                else:
-                    st.success("✓ Shuffle test passed - no spurious correlations detected")
     
     enet = full_model.named_steps["enet"]
     st.caption(
@@ -2180,13 +1435,6 @@ def main():
     train_medians = X_train.median(numeric_only=True)
 
     # Ensure scouting has all columns
-    # If league FE enabled, generate one-hot encoding for scouting data
-    if enable_league_fe and "competition_id" in scouting.columns:
-        # Get same dummy columns as training (must match)
-        scouting_dummies = pd.get_dummies(scouting["competition_id"], prefix="league", drop_first=True)
-        for col in scouting_dummies.columns:
-            scouting[col] = scouting_dummies[col].astype(float)
-    
     scout_X = scouting.reindex(columns=all_features).copy()
     for c in all_features:
         if c not in scout_X.columns:
@@ -2214,29 +1462,23 @@ def main():
             np.nan
         )
     else:
-        # PHASE 3: Compute residuals at FULL PRECISION (no rounding before calculation)
         scouting["residual"] = scouting[PRIMARY_TARGET].astype(float) - scouting["pred_np_xg_90"]
     
-    # PHASE 3: Residual diagnostics for scouting pool (FULL PRECISION)
+    # Residual diagnostics for scouting pool
     residuals_scout = scouting["residual"].dropna()
     if len(residuals_scout) > 0:
         scout_residual_stats = {
             "min": float(residuals_scout.min()),
             "max": float(residuals_scout.max()),
             "mean": float(residuals_scout.mean()),
-            "std": float(residuals_scout.std(ddof=1)),  # Sample std
-            "mean_abs": float(np.mean(np.abs(residuals_scout.values))),
-            "max_abs": float(np.max(np.abs(residuals_scout.values))),
+            "std": float(residuals_scout.std(ddof=0)),
             "unique": int(residuals_scout.nunique()),
             "all_zero": bool(np.allclose(residuals_scout.values, 0, atol=1e-10))
         }
         
-        with st.expander("📊 Residual Diagnostics (Scouting Pool)", expanded=False):
-            st.write("**Residual statistics on scouting pool (FULL PRECISION):**")
-            # Display with 6 decimal precision
-            display_stats = {k: f"{v:.6f}" if isinstance(v, float) else v 
-                           for k, v in scout_residual_stats.items()}
-            st.json(display_stats)
+        with st.expander("📊 Scouting Residual Diagnostics"):
+            st.write("Residual statistics on scouting pool:")
+            st.json(scout_residual_stats)
             if scout_residual_stats["all_zero"]:
                 st.error("⚠️ All scouting residuals are ~0! This indicates perfect predictions (likely leakage).")
             elif scout_residual_stats["std"] < 0.01:
@@ -2343,28 +1585,12 @@ def main():
     # Update show_cols to include rank at the beginning
     show_cols_with_rank = ["rank"] + show_cols if "rank" in shortlist.columns else show_cols
     
-    # PHASE 3: Format with proper precision - NEVER round residual to 3 decimals
-    # Use 6 decimal precision for residual, 3 for predictions
-    for col in ["pred_np_xg_90", "pred_goals_90_avg_finish", PRIMARY_TARGET]:
+    # Formatting
+    for col in ["pred_np_xg_90", "pred_goals_90_avg_finish", PRIMARY_TARGET, "residual"]:
         if col in shortlist.columns:
             shortlist[col] = shortlist[col].astype(float).round(3)
-    
-    # PHASE 3: Keep residual at higher precision (6 decimals max)
-    if "residual" in shortlist.columns:
-        shortlist["residual"] = shortlist["residual"].astype(float)  # Full precision, no rounding
 
-    # Display with styling for residual column (6 decimal format)
-    def style_residual(val):
-        if pd.isna(val):
-            return ""
-        return f"{val:.6f}"
-    
-    shortlist_display = shortlist[show_cols_with_rank].copy()
-    if "residual" in shortlist_display.columns:
-        shortlist_styled = shortlist_display.style.format({"residual": style_residual})
-        st.dataframe(shortlist_styled, width="stretch", hide_index=True)
-    else:
-        st.dataframe(shortlist_display, width="stretch", hide_index=True)
+    st.dataframe(shortlist[show_cols_with_rank], width="stretch", hide_index=True)
 
     st.caption(
         "Tip: Residual > 0 = producing more np_xg than the model expects given traits + team context (could be role/system quirks). "
@@ -2372,11 +1598,7 @@ def main():
     )
 
     with st.expander("Download shortlist as CSV"):
-        # PHASE 3: Export residual at full precision (6 decimals)
-        csv_df = shortlist[show_cols_with_rank].copy()
-        if "residual" in csv_df.columns:
-            csv_df["residual"] = csv_df["residual"].apply(lambda x: f"{x:.6f}" if pd.notna(x) else "")
-        csv = csv_df.to_csv(index=False).encode("utf-8")
+        csv = shortlist[show_cols_with_rank].to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="spfl_st_shortlist.csv", mime="text/csv")
 
     st.divider()
