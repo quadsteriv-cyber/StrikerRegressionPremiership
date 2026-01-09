@@ -1458,6 +1458,7 @@ def main():
         st.session_state.control_rows = control_rows
         st.session_state.model_settings_key = model_settings_key
         st.session_state.leakage_diag = leakage_diag  # Cache for diagnostics
+        st.session_state.train_base = train_base  # Cache training data for experiments
     else:
         # Use cached model
         full_model = st.session_state.full_model
@@ -1772,16 +1773,23 @@ def main():
             if run_perm_btn:
                 with st.spinner(f"Running {n_perm} permutations..."):
                     try:
+                        # Use train_base (the SPFL training data)
+                        if "train_base" not in st.session_state or st.session_state.get("train_base") is None:
+                            st.error("No training data available. Please load data first.")
+                            return
+                        
+                        train_data_perm = st.session_state["train_base"]
+                        
                         # Prepare temporal train/test split
-                        if "canonical_season" in train.columns:
-                            train_sorted = train.sort_values("canonical_season")
+                        if "canonical_season" in train_data_perm.columns:
+                            train_sorted = train_data_perm.sort_values("canonical_season")
                             n_train = len(train_sorted)
                             split_idx = max(int(0.7 * n_train), 10)
                             temporal_train = train_sorted.iloc[:split_idx]
                             temporal_test = train_sorted.iloc[split_idx:]
                         else:
                             from sklearn.model_selection import train_test_split
-                            temporal_train, temporal_test = train_test_split(train, test_size=0.3, random_state=42)
+                            temporal_train, temporal_test = train_test_split(train_data_perm, test_size=0.3, random_state=42)
                         
                         # Build feature matrices
                         X_train_perm, y_train_perm, _, _, _ = build_feature_matrix(
@@ -1881,17 +1889,23 @@ def main():
     if experiment_mode and run_experiment_btn:
         with st.spinner("Running ablation experiment (M0, M1, M2)..."):
             try:
-                # Prepare train/test split for temporal validation
-                if "canonical_season" in train.columns:
-                    train_sorted = train.sort_values("canonical_season")
-                    n_train = len(train_sorted)
-                    split_idx = max(int(0.7 * n_train), 10)
-                    temporal_train = train_sorted.iloc[:split_idx]
-                    temporal_test = train_sorted.iloc[split_idx:]
+                # Use train_base from session_state
+                if "train_base" not in st.session_state:
+                    st.error("No training data available. Please load data first.")
                 else:
-                    # Fallback: random 70/30 split
-                    from sklearn.model_selection import train_test_split
-                    temporal_train, temporal_test = train_test_split(train, test_size=0.3, random_state=42)
+                    train_data_abl = st.session_state["train_base"]
+                    
+                    # Prepare train/test split for temporal validation
+                    if "canonical_season" in train_data_abl.columns:
+                        train_sorted = train_data_abl.sort_values("canonical_season")
+                        n_train = len(train_sorted)
+                        split_idx = max(int(0.7 * n_train), 10)
+                        temporal_train = train_sorted.iloc[:split_idx]
+                        temporal_test = train_sorted.iloc[split_idx:]
+                    else:
+                        # Fallback: random 70/30 split
+                        from sklearn.model_selection import train_test_split
+                        temporal_train, temporal_test = train_test_split(train_data_abl, test_size=0.3, random_state=42)
                 
                 # Run experiment
                 experiment_results = run_ablation_experiment(
