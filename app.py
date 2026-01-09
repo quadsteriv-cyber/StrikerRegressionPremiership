@@ -534,11 +534,13 @@ def build_feature_matrix(
     target: str,
     include_team_controls: bool = True,
     add_age_poly: bool = True,
+    enable_league_fixed_effects: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str], Dict]:
     """
     Builds X, y plus metadata: player_features, team_features, leakage_diagnostics
     - Player features: all numeric player columns excluding banned/leakage
     - Team controls: small list from get_team_control_columns()
+    - League fixed effects (optional): one-hot encode competition_id to learn league-level differences
     - Leakage diagnostics: correlation analysis and dropped features
     """
 
@@ -584,11 +586,20 @@ def build_feature_matrix(
             X["age_sq"] = (df["age"].astype(float) ** 2)
             player_age_cols.append("age_sq")
 
+    # PHASE 7: Optional league fixed effects
+    league_fe_cols = []
+    if enable_league_fixed_effects and "competition_id" in df.columns:
+        # One-hot encode competition_id (drop first to avoid multicollinearity)
+        comp_dummies = pd.get_dummies(df["competition_id"], prefix="league", drop_first=True)
+        for col in comp_dummies.columns:
+            X[col] = comp_dummies[col].astype(float)
+            league_fe_cols.append(col)
+
     y = df[target].astype(float)
 
     # Keep track: “player features” for interpretability exclude team cols but include age terms
     player_features = player_num + player_age_cols
-    team_features = team_cols
+    team_features = team_cols + league_fe_cols  # League FE grouped with team controls
 
     # Drop any columns with all-NaN
     X = X.dropna(axis=1, how="all")
@@ -785,12 +796,22 @@ def main():
         st.header("4) Output Settings")
         sort_by = st.selectbox("Sort shortlist by", ["pred_np_xg_90", "pred_goals_90_avg_finish", "residual"], index=0,
                               help="pred_goals_90_avg_finish assumes league-average finishing (multiplier=1.0)")
+        
+        compute_intervals = st.checkbox("🔄 Compute model-uncertainty intervals (slow)",
+                                       value=False,
+                                       help="Bootstrap prediction intervals - may take 30-60 seconds")
+        
+        st.divider()
+        st.header("5) League Adjustments (Advanced)")
+        enable_league_fe = st.checkbox("⚙️ Learn league fixed effects",
+                                       value=False,
+                                       help="Add one-hot competition features - may improve fit but reduces interpretability")
 
         st.divider()
         load_btn = st.button("Load / Refresh Data", type="primary")
 
     # Check if model settings changed (requires refit)
-    model_settings_key = f"{include_team_controls}_{add_age_poly}_{n_boot}_{sample_frac}"
+    model_settings_key = f"{include_team_controls}_{add_age_poly}_{enable_league_fe}_{n_boot}_{sample_frac}"
     model_settings_changed = st.session_state.get("model_settings_key") != model_settings_key
     
     # Persist data in session state
@@ -957,6 +978,7 @@ def main():
                 target=PRIMARY_TARGET,
                 include_team_controls=include_team_controls,
                 add_age_poly=add_age_poly,
+                enable_league_fixed_effects=enable_league_fe,
             )
         except Exception as e:
             st.error(f"Feature matrix build failed: {e}")
@@ -1143,10 +1165,10 @@ def main():
                 
                 try:
                     X_temp_train, y_temp_train, _, _, _ = build_feature_matrix(
-                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly
+                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
                     )
                     X_temp_test, y_temp_test, _, _, _ = build_feature_matrix(
-                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly
+                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
                     )
                     
                     # Align features
@@ -1221,10 +1243,10 @@ def main():
                 try:
                     # Build feature matrices
                     X_cross_train, y_cross_train, _, _, _ = build_feature_matrix(
-                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly
+                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
                     )
                     X_cross_test, y_cross_test, _, _, _ = build_feature_matrix(
-                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly
+                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe
                     )
                     
                     # Align features
@@ -1414,6 +1436,13 @@ def main():
     train_medians = X_train.median(numeric_only=True)
 
     # Ensure scouting has all columns
+    # If league FE enabled, generate one-hot encoding for scouting data
+    if enable_league_fe and "competition_id" in scouting.columns:
+        # Get same dummy columns as training (must match)
+        scouting_dummies = pd.get_dummies(scouting["competition_id"], prefix="league", drop_first=True)
+        for col in scouting_dummies.columns:
+            scouting[col] = scouting_dummies[col].astype(float)
+    
     scout_X = scouting.reindex(columns=all_features).copy()
     for c in all_features:
         if c not in scout_X.columns:
@@ -1465,6 +1494,73 @@ def main():
             else:
                 st.success("✓ Scouting residuals show normal variation.")
     
+    # ============================================
+    # PHASE 6: OPTIONAL PREDICTION INTERVALS
+    # ============================================
+    if compute_intervals:
+        import hashlib
+        
+        # Create stable hash for caching
+        X_hash = hashlib.md5(pd.util.hash_pandas_object(X, index=True).values).hexdigest()
+        scout_hash = hashlib.md5(pd.util.hash_pandas_object(scout_X, index=True).values).hexdigest()
+        cache_key = f"intervals_{X_hash}_{scout_hash}_{n_boot}_{sample_frac}"
+        
+        if cache_key in st.session_state:
+            intervals = st.session_state[cache_key]
+            st.caption("✓ Using cached prediction intervals")
+        else:
+            with st.spinner("Computing bootstrap prediction intervals (this may take 30-60s)..."):
+                intervals_start = time.time()
+                
+                # Bootstrap with faster CV settings
+                n_boot_intervals = 50  # Reduced from stability selection
+                interval_preds = []
+                
+                rng = np.random.default_rng(42)
+                n_samples = len(X)
+                
+                for b in range(n_boot_intervals):
+                    # Resample training data
+                    idx = rng.choice(np.arange(n_samples), size=max(10, int(0.85 * n_samples)), replace=True)
+                    X_boot = X.values[idx, :]
+                    y_boot = y.values[idx]
+                    
+                    # Faster ElasticNetCV
+                    cv_fast = KFold(n_splits=3, shuffle=True, random_state=int(rng.integers(1, 1_000_000)))
+                    model_boot = Pipeline(steps=[
+                        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                        ("enet", ElasticNetCV(
+                            l1_ratio=[0.1, 0.5, 0.9],
+                            alphas=np.logspace(-4, 1, 30),
+                            cv=cv_fast,
+                            max_iter=10000,
+                            random_state=int(rng.integers(1, 1_000_000)),
+                        )),
+                    ])
+                    model_boot.fit(X_boot, y_boot)
+                    
+                    # Predict on scouting pool
+                    pred_boot = model_boot.predict(scout_X.values)
+                    interval_preds.append(pred_boot)
+                
+                interval_preds = np.array(interval_preds)
+                intervals = {
+                    "lower": np.percentile(interval_preds, 5, axis=0),
+                    "upper": np.percentile(interval_preds, 95, axis=0),
+                    "median": np.percentile(interval_preds, 50, axis=0)
+                }
+                
+                st.session_state[cache_key] = intervals
+                intervals_time = time.time() - intervals_start
+                st.caption(f"✓ Computed intervals in {intervals_time:.1f}s")
+        
+        # Add intervals to scouting dataframe
+        scouting["pred_lower_90"] = intervals["lower"]
+        scouting["pred_upper_90"] = intervals["upper"]
+        scouting["pred_median"] = intervals["median"]
+        
+        st.info("📊 Prediction intervals represent **model uncertainty**, not confidence about true player ability. Wide intervals indicate features don't strongly constrain predictions.")
+    
     # Cache scouting stats for instant player selection
     st.session_state.scouting_pool = scouting
     st.session_state.scouting_means = {col: scouting[col].astype(float).mean() 
@@ -1473,10 +1569,13 @@ def main():
                                       for col in scouting.select_dtypes(include=[np.number]).columns}
 
     # Display
-    show_cols = [c for c in [
-        "player_name", "age", "primary_position", "team_name", "league_name", "season_name",
-        "minutes", PRIMARY_TARGET, "pred_np_xg_90", "pred_goals_90_avg_finish", "residual"
-    ] if c in scouting.columns]
+    base_cols = ["player_name", "age", "primary_position", "team_name", "league_name", "season_name",
+                 "minutes", PRIMARY_TARGET, "pred_np_xg_90", "pred_goals_90_avg_finish", "residual"]
+    
+    if compute_intervals:
+        base_cols.extend(["pred_lower_90", "pred_upper_90"])
+    
+    show_cols = [c for c in base_cols if c in scouting.columns]
     
     # Warning for residual sort
     if sort_by == "residual":
