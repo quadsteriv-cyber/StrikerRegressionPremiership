@@ -813,6 +813,13 @@ def main():
         st.header("3) Model Settings")
         include_team_controls = st.checkbox("Include team-season controls (recommended)", value=True)
         add_age_poly = st.checkbox("Use age + age² (recommended)", value=True)
+        
+        st.divider()
+        allow_xg_identity = st.checkbox("⚠️ Allow xG-derived predictors (identity risk)",
+                                       value=False,
+                                       help="When OFF: excludes xG, npxg, shots_90, etc. Model uses only upstream behaviours.")
+        if not allow_xg_identity:
+            st.caption("🛡️ Model restricted to upstream behavioural features (touches, receptions, carries, pressures, aerials, etc.)")
 
         n_boot = st.slider("Stability selection bootstraps", 30, 300, 120, 10)
         sample_frac = st.slider("Bootstrap sample fraction", 0.50, 1.00, 0.85, 0.05)
