@@ -31,6 +31,7 @@ from sklearn.linear_model import ElasticNetCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import KFold
+from scipy.stats import spearmanr
 
 
 # -----------------------------
@@ -107,6 +108,20 @@ ST_POSITION_LABELS = {
 }
 
 PRIMARY_TARGET = "np_xg_90"  # after prefix stripping
+
+# ABLATION EXPERIMENT: Near-shot proxy features
+# These are NOT leakage - they're proximate predictors we test for dependence
+NEAR_SHOT_PROXY_FEATURES = {
+    "touches_inside_box_90",
+    "passes_into_box_90",
+    "passes_inside_box_90",
+    "sp_passes_into_box_90",
+    "op_passes_into_box_90",
+    "key_passes_90",
+    "op_key_passes_90",
+    "sp_key_passes_90",
+    "op_passes_into_and_touches_inside_box_90",
+}
 
 
 # -----------------------------
@@ -537,11 +552,14 @@ def build_feature_matrix(
     enable_league_fixed_effects: bool = False,
     behaviour_only: bool = True,
     allow_xg_identity: bool = False,
+    ablation_mode: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str], Dict]:
     """
     Builds X, y plus metadata: player_features, team_features, leakage_diagnostics
     - Player features: all numeric player columns excluding banned/leakage
     - Team controls: small list from get_team_control_columns()
+    - Ablation mode (optional): "M1_upstream_only" or "M2_near_shot_only" for experiments
+
     - League fixed effects (optional): one-hot encode competition_id to learn league-level differences
     - Leakage diagnostics: correlation analysis and dropped features
     """
@@ -793,6 +811,34 @@ def build_feature_matrix(
     # Update final stats
     leakage_diagnostics["guardrail_stats"]["final_feature_count"] = len(X.columns)
     leakage_diagnostics["kept_features"] = list(X.columns)[:50]  # First 50 kept
+    
+    # ============================================
+    # ABLATION MODE (EXPERIMENT ONLY - non-breaking)
+    # ============================================
+    if ablation_mode is not None:
+        # Identify control columns (age, team, league FE) - keep these regardless
+        control_cols = []
+        if "age" in X.columns:
+            control_cols.append("age")
+        if "age_sq" in X.columns:
+            control_cols.append("age_sq")
+        control_cols.extend([c for c in X.columns if c.startswith("team_") or c.startswith("league_")])
+        
+        if ablation_mode == "M1_upstream_only":
+            # Drop near-shot proxy features, keep everything else
+            drop_near_shot = [c for c in X.columns if c in NEAR_SHOT_PROXY_FEATURES]
+            if drop_near_shot:
+                X = X.drop(columns=drop_near_shot)
+                player_features = [f for f in player_features if f not in NEAR_SHOT_PROXY_FEATURES]
+                leakage_diagnostics["ablation_dropped"] = drop_near_shot
+        
+        elif ablation_mode == "M2_near_shot_only":
+            # Keep ONLY near-shot proxies + controls
+            keep_cols = control_cols + [c for c in X.columns if c in NEAR_SHOT_PROXY_FEATURES]
+            keep_cols = list(set(keep_cols))  # dedupe
+            X = X[keep_cols]
+            player_features = [f for f in player_features if f in NEAR_SHOT_PROXY_FEATURES]
+            leakage_diagnostics["ablation_kept_only"] = keep_cols
 
     return X, y, player_features, team_features, leakage_diagnostics
 
@@ -865,6 +911,132 @@ def stability_selection(
     return out
 
 
+def run_ablation_experiment(
+    train_data: pd.DataFrame,
+    test_data: pd.DataFrame,
+    scouting_data: pd.DataFrame,
+    target: str,
+    include_team_controls: bool,
+    add_age_poly: bool,
+    enable_league_fe: bool,
+    behaviour_only: bool,
+    allow_xg_identity: bool,
+    run_shuffle_test: bool = False,
+) -> Dict:
+    """
+    Run ablation experiment comparing M0 (baseline), M1 (upstream-only), M2 (near-shot only).
+    
+    Returns dict with:
+    - "models": {mode: trained_model}
+    - "metrics": {mode: {"r2_test": float, "mae_test": float, "features": List[str]}}
+    - "predictions": {mode: {"test": np.array, "scouting": np.array}}
+    - "shuffle_metrics": (if run_shuffle_test) {mode: {"r2_test": float, "mae_test": float}}
+    """
+    results = {
+        "models": {},
+        "metrics": {},
+        "predictions": {},
+        "feature_lists": {},
+    }
+    
+    modes = ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]
+    
+    for mode in modes:
+        # Extract ablation mode suffix
+        ablation_mode = mode if mode != "M0_baseline" else None
+        
+        # Build feature matrices
+        X_train, y_train, _, _, _ = build_feature_matrix(
+            train_data, target, include_team_controls, add_age_poly, enable_league_fe, 
+            behaviour_only, allow_xg_identity, ablation_mode=ablation_mode
+        )
+        X_test, y_test, _, _, _ = build_feature_matrix(
+            test_data, target, include_team_controls, add_age_poly, enable_league_fe,
+            behaviour_only, allow_xg_identity, ablation_mode=ablation_mode
+        )
+        X_scouting, _, _, _, _ = build_feature_matrix(
+            scouting_data, target, include_team_controls, add_age_poly, enable_league_fe,
+            behaviour_only, allow_xg_identity, ablation_mode=ablation_mode
+        )
+        
+        # Align features
+        common_features = list(set(X_train.columns) & set(X_test.columns) & set(X_scouting.columns))
+        X_train = X_train[common_features]
+        X_test = X_test[common_features]
+        X_scouting = X_scouting[common_features]
+        
+        # Train model
+        model = fit_elastic_net_cv(X_train, y_train, random_state=42)
+        
+        # Predictions
+        y_test_pred = model.predict(X_test.values)
+        y_scouting_pred = model.predict(X_scouting.values)
+        
+        # Metrics
+        corr_test = np.corrcoef(y_test.values, y_test_pred)[0, 1]
+        r2_test = corr_test ** 2 if not np.isnan(corr_test) else 0.0
+        mae_test = float(np.mean(np.abs(y_test.values - y_test_pred)))
+        
+        # Store results
+        results["models"][mode] = model
+        results["metrics"][mode] = {
+            "r2_test": r2_test,
+            "mae_test": mae_test,
+            "n_features": len(common_features),
+            "n_nonzero": int(np.sum(model.named_steps["enet"].coef_ != 0)),
+        }
+        results["predictions"][mode] = {
+            "test": y_test_pred,
+            "scouting": y_scouting_pred,
+        }
+        results["feature_lists"][mode] = common_features
+        
+        # Shuffle sanity test (should yield ~zero performance)
+        if run_shuffle_test:
+            if "shuffle_metrics" not in results:
+                results["shuffle_metrics"] = {}
+            
+            rng = np.random.default_rng(42)
+            y_train_shuffled = y_train.copy()
+            y_train_shuffled.iloc[:] = rng.permutation(y_train_shuffled.values)
+            
+            shuffle_model = fit_elastic_net_cv(X_train, y_train_shuffled, random_state=43)
+            y_test_shuffle_pred = shuffle_model.predict(X_test.values)
+            
+            corr_shuffle = np.corrcoef(y_test.values, y_test_shuffle_pred)[0, 1]
+            r2_shuffle = corr_shuffle ** 2 if not np.isnan(corr_shuffle) else 0.0
+            mae_shuffle = float(np.mean(np.abs(y_test.values - y_test_shuffle_pred)))
+            
+            results["shuffle_metrics"][mode] = {
+                "r2_test": r2_shuffle,
+                "mae_test": mae_shuffle,
+            }
+    
+    # Compute dependence diagnostics (correlations between model predictions)
+    results["dependence"] = {}
+    for m1 in modes:
+        for m2 in modes:
+            if m1 < m2:  # Avoid duplicate pairs
+                pred1 = results["predictions"][m1]["scouting"]
+                pred2 = results["predictions"][m2]["scouting"]
+                
+                # Spearman rank correlation
+                from scipy.stats import spearmanr
+                rho, _ = spearmanr(pred1, pred2)
+                
+                # Top-30 overlap
+                top30_m1 = set(np.argsort(-pred1)[:30])
+                top30_m2 = set(np.argsort(-pred2)[:30])
+                overlap = len(top30_m1 & top30_m2)
+                
+                results["dependence"][f"{m1}_vs_{m2}"] = {
+                    "spearman": float(rho),
+                    "top30_overlap": overlap,
+                }
+    
+    return results
+
+
 # -----------------------------
 # 5) Streamlit UI
 # -----------------------------
@@ -875,8 +1047,15 @@ def main():
 
     with st.sidebar:
         st.header("1) StatsBomb Credentials")
-        sb_user = st.text_input("Username", value=st.secrets.get("STATS_BOMB_USER", ""), type="default")
-        sb_pass = st.text_input("Password", value=st.secrets.get("STATS_BOMB_PASS", ""), type="password")
+        try:
+            default_user = st.secrets.get("STATS_BOMB_USER", "")
+            default_pass = st.secrets.get("STATS_BOMB_PASS", "")
+        except:
+            default_user = ""
+            default_pass = ""
+        
+        sb_user = st.text_input("Username", value=default_user, type="default")
+        sb_pass = st.text_input("Password", value=default_pass, type="password")
         auth = (sb_user, sb_pass)
 
         st.divider()
@@ -906,7 +1085,14 @@ def main():
             season_filter = None
 
         st.divider()
-        st.header("3) Model Settings")
+        st.header("3) Experiment Mode TEST")
+        experiment_mode = st.checkbox("Enable Experiment Mode", value=False)
+        run_experiment_btn = False
+        run_shuffle_test = False
+        experiment_config = "(M0) Baseline (current model)"
+        
+        st.divider()
+        st.header("4) Model Settings")
         include_team_controls = st.checkbox("Include team-season controls (recommended)", value=True)
         add_age_poly = st.checkbox("Use age + age² (recommended)", value=True)
         
@@ -929,7 +1115,7 @@ def main():
         top_k = st.slider("Show Top-K predictors", 3, 20, 5, 1)
         
         st.divider()
-        st.header("4) Output Settings")
+        st.header("5) Output Settings")
         sort_by = st.selectbox("Sort shortlist by", ["pred_np_xg_90", "pred_goals_90_avg_finish", "residual"], index=0,
                               help="pred_goals_90_avg_finish assumes league-average finishing (multiplier=1.0)")
         
@@ -938,7 +1124,7 @@ def main():
                                        help="Bootstrap prediction intervals - may take 30-60 seconds")
         
         st.divider()
-        st.header("5) League Adjustments (Advanced)")
+        st.header("6) League Adjustments (Advanced)")
         enable_league_fe = st.checkbox("⚙️ Learn league fixed effects",
                                        value=False,
                                        help="Add one-hot competition features - may improve fit but reduces interpretability")
@@ -1537,6 +1723,124 @@ def main():
                     
                 except Exception as e:
                     st.error(f"Cross-league test failed: {e}")
+    
+    # ============================================
+    # ABLATION EXPERIMENT (OPTIONAL)
+    # ============================================
+    if experiment_mode and run_experiment_btn:
+        with st.spinner("Running ablation experiment (M0, M1, M2)..."):
+            try:
+                # Prepare train/test split for temporal validation
+                if "canonical_season" in train.columns:
+                    train_sorted = train.sort_values("canonical_season")
+                    n_train = len(train_sorted)
+                    split_idx = max(int(0.7 * n_train), 10)
+                    temporal_train = train_sorted.iloc[:split_idx]
+                    temporal_test = train_sorted.iloc[split_idx:]
+                else:
+                    # Fallback: random 70/30 split
+                    from sklearn.model_selection import train_test_split
+                    temporal_train, temporal_test = train_test_split(train, test_size=0.3, random_state=42)
+                
+                # Run experiment
+                experiment_results = run_ablation_experiment(
+                    train_data=temporal_train,
+                    test_data=temporal_test,
+                    scouting_data=scouting,
+                    target=PRIMARY_TARGET,
+                    include_team_controls=include_team_controls,
+                    add_age_poly=add_age_poly,
+                    enable_league_fe=enable_league_fe,
+                    behaviour_only=behaviour_only,
+                    allow_xg_identity=allow_xg_identity,
+                    run_shuffle_test=run_shuffle_test,
+                )
+                
+                # Cache results
+                st.session_state["ablation_results"] = experiment_results
+                st.success("✓ Experiment completed")
+                
+            except Exception as e:
+                st.error(f"Experiment failed: {e}")
+    
+    # Display experiment results (if available)
+    if experiment_mode and "ablation_results" in st.session_state:
+        with st.expander("🔬 Ablation Experiment Results", expanded=True):
+            results = st.session_state["ablation_results"]
+            
+            st.markdown("""
+            **Test:** Does model performance depend on near-shot proxy features vs upstream behaviours?
+            
+            - **M0 (Baseline)**: All behaviour features (current model)
+            - **M1 (Upstream-only)**: Removes near-shot proxies (touches_inside_box, passes_into_box, etc.)
+            - **M2 (Near-shot only)**: Keeps only near-shot proxies + controls (age, team, league)
+            """)
+            
+            # Metrics comparison table
+            st.subheader("📊 Test Set Performance")
+            metrics_df = pd.DataFrame({
+                "Model": ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"],
+                "R²": [results["metrics"][m]["r2_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
+                "MAE": [results["metrics"][m]["mae_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
+                "Features": [results["metrics"][m]["n_features"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
+                "Non-zero": [results["metrics"][m]["n_nonzero"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
+            })
+            st.dataframe(metrics_df.style.format({"R²": "{:.4f}", "MAE": "{:.4f}"}), width="stretch", hide_index=True)
+            
+            # Interpretation
+            r2_m0 = results["metrics"]["M0_baseline"]["r2_test"]
+            r2_m1 = results["metrics"]["M1_upstream_only"]["r2_test"]
+            r2_m2 = results["metrics"]["M2_near_shot_only"]["r2_test"]
+            
+            if r2_m2 > r2_m1 * 1.5:
+                st.warning("⚠️ Performance heavily depends on near-shot proxies - model may be learning shot generation rather than upstream behaviours")
+            elif r2_m1 > r2_m2:
+                st.success("✓ Upstream behaviours provide stronger signal than near-shot proxies - defensible behaviour-only model")
+            else:
+                st.info("ℹ️ Mixed signal - both upstream and near-shot features contribute")
+            
+            # Dependence diagnostics
+            st.subheader("🔗 Model Agreement Diagnostics")
+            st.caption("How similar are the model rankings?")
+            
+            dep_df = []
+            for key, vals in results["dependence"].items():
+                m1, m2 = key.split("_vs_")
+                dep_df.append({
+                    "Comparison": f"{m1} vs {m2}",
+                    "Spearman ρ": vals["spearman"],
+                    "Top-30 overlap": vals["top30_overlap"],
+                })
+            
+            dep_table = pd.DataFrame(dep_df)
+            st.dataframe(dep_table.style.format({"Spearman ρ": "{:.3f}"}), width="stretch", hide_index=True)
+            
+            if len(dep_df) > 0:
+                avg_spearman = np.mean([d["Spearman ρ"] for d in dep_df])
+                if avg_spearman < 0.5:
+                    st.error("❌ Low agreement between models - predictions are highly dependent on feature set choice")
+                elif avg_spearman < 0.8:
+                    st.warning("⚠️ Moderate agreement - feature set matters for ranking")
+                else:
+                    st.success("✓ High agreement - rankings are robust to feature set changes")
+            
+            # Shuffle sanity test
+            if run_shuffle_test and "shuffle_metrics" in results:
+                st.subheader("🎲 Shuffle Sanity Test")
+                st.caption("Training on shuffled target should yield ~zero test performance")
+                
+                shuffle_df = pd.DataFrame({
+                    "Model": ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"],
+                    "Shuffle R²": [results["shuffle_metrics"][m]["r2_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
+                    "Shuffle MAE": [results["shuffle_metrics"][m]["mae_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]],
+                })
+                st.dataframe(shuffle_df.style.format({"Shuffle R²": "{:.4f}", "Shuffle MAE": "{:.4f}"}), width="stretch", hide_index=True)
+                
+                max_shuffle_r2 = max([results["shuffle_metrics"][m]["r2_test"] for m in ["M0_baseline", "M1_upstream_only", "M2_near_shot_only"]])
+                if max_shuffle_r2 > 0.05:
+                    st.error("🚨 Shuffle test shows non-trivial R² - possible data leakage!")
+                else:
+                    st.success("✓ Shuffle test passed - no spurious correlations detected")
     
     enet = full_model.named_steps["enet"]
     st.caption(
