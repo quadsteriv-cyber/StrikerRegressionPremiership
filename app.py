@@ -1067,6 +1067,20 @@ def main():
     st.title("SPFL Striker Chance-Generation Drivers (StatsBomb IQ season stats)")
 
     with st.sidebar:
+        # DIAGNOSTICS: Confirm which file is running
+        import os
+        st.caption(f"RUNNING FILE: {os.path.abspath(__file__)}")
+        st.caption(f"BOOT TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        st.error("✅ NEW CODE LOADED - Jan 9 2026")
+        
+        # Hard cache reset
+        if st.button("🔄 HARD CLEAR CACHE"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.clear()
+            st.rerun()
+        
+        st.divider()
         st.header("1) StatsBomb Credentials")
         try:
             default_user = st.secrets.get("STATS_BOMB_USER", "")
@@ -1749,7 +1763,9 @@ def main():
     # ============================================
     # PERMUTATION TEST (EXPERIMENT MODE ONLY)
     # ============================================
+    st.write(f"DEBUG: experiment_mode = {experiment_mode}")  # DIAGNOSTIC
     if experiment_mode:
+        st.subheader("🧪 PERMUTATION TEST SECTION RENDERED")  # DIAGNOSTIC
         with st.expander("🧪 Permutation Test (Shuffle Test)", expanded=False):
             st.markdown("""
             **Purpose**: Test if the model beats chance by comparing real test R² against permuted-target models.
