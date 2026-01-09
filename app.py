@@ -91,6 +91,9 @@ COMPETITION_SEASONS: Dict[int, List[int]] = {
 DOMESTIC_LEAGUE_IDS = [51, 1385, 4, 5, 107]
 SCOTTISH_LEAGUE_IDS = [51, 1385]
 
+# Candidate training leagues (will be filtered dynamically based on data availability)
+CANDIDATE_TRAINING_LEAGUE_IDS = [51, 1385, 107, 4, 5, 1442]
+
 # Position filtering for “ST-only”
 # StatsBomb season player-stats sometimes returns a string label in primary_position;
 # if it's numeric in your account, you can adjust this.
@@ -104,73 +107,6 @@ ST_POSITION_LABELS = {
 }
 
 PRIMARY_TARGET = "np_xg_90"  # after prefix stripping
-
-# Candidate training leagues (will be filtered dynamically based on data availability)
-CANDIDATE_TRAINING_LEAGUE_IDS = [51, 1385, 107, 4, 5, 1442]
-
-
-# -----------------------------
-# Temporal validation helpers
-# -----------------------------
-
-def prepare_temporal_split(df: pd.DataFrame, min_train: int = 10, min_test: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
-    """Split data temporally within each competition using canonical_season.
-    
-    Returns:
-        train_df, test_df, report_dict
-    """
-    if "canonical_season" not in df.columns or "competition_id" not in df.columns:
-        st.error("Missing canonical_season or competition_id columns")
-        return df, pd.DataFrame(), {}
-    
-    train_frames = []
-    test_frames = []
-    excluded_comps = []
-    comp_reports = []
-    
-    for comp_id in df["competition_id"].unique():
-        comp_df = df[df["competition_id"] == comp_id].copy()
-        
-        # Get max season for this competition
-        max_season = comp_df["canonical_season"].max()
-        
-        # Split
-        test_comp = comp_df[comp_df["canonical_season"] == max_season]
-        train_comp = comp_df[comp_df["canonical_season"] < max_season]
-        
-        # Check safeguards
-        if len(train_comp) < min_train:
-            excluded_comps.append({"comp_id": comp_id, "reason": f"train_rows={len(train_comp)} < {min_train}"})
-            continue
-        if len(test_comp) < min_test:
-            excluded_comps.append({"comp_id": comp_id, "reason": f"test_rows={len(test_comp)} < {min_test}"})
-            continue
-        if train_comp.empty:
-            excluded_comps.append({"comp_id": comp_id, "reason": "no earlier seasons"})
-            continue
-        
-        train_frames.append(train_comp)
-        test_frames.append(test_comp)
-        comp_reports.append({
-            "comp_id": comp_id,
-            "league_name": LEAGUE_NAMES.get(comp_id, f"Comp {comp_id}"),
-            "train_rows": len(train_comp),
-            "test_rows": len(test_comp),
-            "train_seasons": train_comp["canonical_season"].nunique(),
-            "test_season": max_season
-        })
-    
-    train_df = pd.concat(train_frames, ignore_index=True) if train_frames else pd.DataFrame()
-    test_df = pd.concat(test_frames, ignore_index=True) if test_frames else pd.DataFrame()
-    
-    report = {
-        "comp_reports": comp_reports,
-        "excluded_comps": excluded_comps,
-        "total_train": len(train_df),
-        "total_test": len(test_df)
-    }
-    
-    return train_df, test_df, report
 
 
 # -----------------------------
@@ -847,8 +783,8 @@ def main():
         
         st.divider()
         st.header("4) Output Settings")
-        sort_by = st.selectbox("Sort shortlist by", ["pred_np_xg_90", "pred_goals_90_assuming_avg_finish", "residual"], index=0,
-                              help="pred_goals_90 assumes league-average finishing (1.0x conversion)")
+        sort_by = st.selectbox("Sort shortlist by", ["pred_np_xg_90", "pred_goals_90_avg_finish", "residual"], index=0,
+                              help="pred_goals_90_avg_finish assumes league-average finishing (multiplier=1.0)")
 
         st.divider()
         load_btn = st.button("Load / Refresh Data", type="primary")
@@ -952,86 +888,61 @@ def main():
             st.dataframe(pos_counts, width="stretch")
 
     # -----------------------------
-    # TRAINING SET: Multi-league STs >=900 mins (dynamic inclusion)
+    # TRAINING SET: Multi-league STs >=900 mins (dynamically filtered)
     # -----------------------------
-    st.subheader("Training Set: Multi-League ST Pool")
+    st.subheader("Training Set (Multi-League)")
     
-    # Apply filters to get candidate training pool
-    train_candidate = merged.copy()
-    train_candidate = apply_common_filters(
-        train_candidate,
+    # Start with candidate leagues
+    train_base = merged.copy()
+    if "competition_id" in train_base.columns:
+        train_base = train_base[train_base["competition_id"].isin(CANDIDATE_TRAINING_LEAGUE_IDS)]
+    
+    # Apply ST + minutes + age filters
+    train_base = apply_common_filters(
+        train_base,
         min_minutes=900,
-        age_range=(18, 35),  # Focused age range for training
-        league_filter="All Leagues",
+        age_range=(18, 35),  # Training age range
+        league_filter="All Leagues",  # Don't apply league filter, we already filtered by CANDIDATE_TRAINING_LEAGUE_IDS
     )
     
-    # Filter to candidate training leagues only
-    train_candidate = train_candidate[train_candidate["competition_id"].isin(CANDIDATE_TRAINING_LEAGUE_IDS)]
-    
-    # Check which leagues have sufficient data (>=25 ST player-seasons)
-    league_coverage = train_candidate.groupby("competition_id").agg(
-        player_seasons=("player_id", "count"),
-        unique_players=("player_id", "nunique"),
-        seasons=("season_id", "nunique")
-    ).reset_index()
-    league_coverage["league_name"] = league_coverage["competition_id"].map(
-        lambda x: LEAGUE_NAMES.get(x, f"Comp {x}")
-    )
-    
-    # Include only leagues with >=25 player-seasons
-    sufficient_leagues = league_coverage[league_coverage["player_seasons"] >= 25]["competition_id"].tolist()
-    
-    if not sufficient_leagues:
-        st.error("No leagues have sufficient data (>=25 ST player-seasons) for training. Lower thresholds or fetch more data.")
-        return
-    
-    train_base = train_candidate[train_candidate["competition_id"].isin(sufficient_leagues)].copy()
-    
-    # Training coverage table
-    training_coverage = league_coverage[league_coverage["competition_id"].isin(sufficient_leagues)].copy()
-    training_coverage = training_coverage.sort_values("player_seasons", ascending=False)
-    
-    with st.expander("📊 Training Coverage", expanded=True):
-        st.dataframe(training_coverage[["competition_id", "league_name", "player_seasons", "unique_players", "seasons"]], 
-                    width="stretch", hide_index=True)
+    # Check coverage per competition
+    if "competition_id" in train_base.columns and not train_base.empty:
+        coverage = train_base.groupby("competition_id").agg(
+            player_seasons=("player_id", "count"),
+            unique_players=("player_id", "nunique"),
+            seasons=("season_id", "nunique")
+        ).reset_index()
+        coverage["league_name"] = coverage["competition_id"].apply(lambda x: LEAGUE_NAMES.get(x, f"Comp {x}"))
+        coverage = coverage[["competition_id", "league_name", "player_seasons", "unique_players", "seasons"]]
+        coverage = coverage[coverage["player_seasons"] >= 25]  # Only keep leagues with >=25 samples
         
-        # Warnings for leagues with <50 player-seasons
-        low_coverage = training_coverage[training_coverage["player_seasons"] < 50]
-        if not low_coverage.empty:
-            st.warning(f"⚠️ {len(low_coverage)} league(s) have <50 player-seasons: {low_coverage['league_name'].tolist()}")
-    
-    # Temporal validation split
-    train_split, test_split, temporal_report = prepare_temporal_split(train_base, min_train=10, min_test=5)
-    
-    if train_split.empty or test_split.empty:
-        st.error("Temporal split failed - insufficient data. Using full training set without validation.")
-        train_split = train_base.copy()
-        test_split = None
-        temporal_report = None
+        if coverage.empty:
+            st.error("No competitions have >=25 player-seasons after filters. Cannot train model.")
+            return
+        
+        # Filter train_base to only include competitions with sufficient data
+        valid_comps = coverage["competition_id"].tolist()
+        train_base = train_base[train_base["competition_id"].isin(valid_comps)]
+        
+        # Display training coverage
+        with st.expander("📊 Training Coverage", expanded=True):
+            st.dataframe(coverage, width="stretch", hide_index=True)
+            
+            # Warnings for low-sample competitions
+            low_sample = coverage[coverage["player_seasons"] < 50]
+            if not low_sample.empty:
+                st.warning(f"⚠️ {len(low_sample)} competition(s) have <50 player-seasons:")
+                st.dataframe(low_sample[["league_name", "player_seasons"]], width="stretch", hide_index=True)
     else:
-        with st.expander("⏰ Temporal Validation Split"):
-            st.write(f"**Total training rows:** {temporal_report['total_train']:,}")
-            st.write(f"**Total test rows:** {temporal_report['total_test']:,}")
-            
-            if temporal_report['comp_reports']:
-                comp_df = pd.DataFrame(temporal_report['comp_reports'])
-                st.markdown("### Per-competition split:")
-                st.dataframe(comp_df, width="stretch", hide_index=True)
-            
-            if temporal_report['excluded_comps']:
-                exc_df = pd.DataFrame(temporal_report['excluded_comps'])
-                exc_df["league_name"] = exc_df["comp_id"].map(lambda x: LEAGUE_NAMES.get(x, f"Comp {x}"))
-                st.warning(f"⚠️ Excluded {len(temporal_report['excluded_comps'])} competitions:")
-                st.dataframe(exc_df[["comp_id", "league_name", "reason"]], width="stretch", hide_index=True)
-
-    if PRIMARY_TARGET not in train_split.columns:
-        st.error(f"Target '{PRIMARY_TARGET}' not found. Check your player-stats endpoint/columns.")
-        st.write("Available columns:", sorted(train_split.columns))
+        st.error("No training data available after filters.")
         return
-    
-    st.write(f"**Training on:** {len(train_split):,} player-seasons from {train_split['competition_id'].nunique()} leagues")
-    if test_split is not None:
-        st.write(f"**Temporal test set:** {len(test_split):,} player-seasons")
+
+    if PRIMARY_TARGET not in train_base.columns:
+        st.error(f"Target '{PRIMARY_TARGET}' not found. Check your player-stats endpoint/columns.")
+        st.write("Available columns:", sorted(train_base.columns))
+        return
+
+    st.caption(f"Total training samples: {len(train_base):,} player-seasons from {train_base['competition_id'].nunique()} competitions")
 
     # -----------------------------
     # Fit model + stability
@@ -1042,7 +953,7 @@ def main():
     if model_settings_changed or "full_model" not in st.session_state:
         try:
             X, y, player_feats, team_feats, leakage_diag = build_feature_matrix(
-                train_split,
+                train_base,
                 target=PRIMARY_TARGET,
                 include_team_controls=include_team_controls,
                 add_age_poly=add_age_poly,
@@ -1160,106 +1071,6 @@ def main():
         st.session_state.trait_rows = trait_rows
         st.session_state.control_rows = control_rows
         st.session_state.model_settings_key = model_settings_key
-        st.session_state.train_competitions = train_split["competition_id"].unique().tolist()
-        
-        # PHASE 2: Temporal validation
-        if test_split is not None and not test_split.empty:
-            try:
-                X_test, y_test, _, _, _ = build_feature_matrix(
-                    test_split,
-                    target=PRIMARY_TARGET,
-                    include_team_controls=include_team_controls,
-                    add_age_poly=add_age_poly,
-                )
-                # Align features
-                for col in all_features:
-                    if col not in X_test.columns:
-                        X_test[col] = 0
-                X_test = X_test[all_features]
-                
-                y_pred_test = full_model.predict(X_test.values)
-                test_corr = np.corrcoef(y_test.values, y_pred_test)[0, 1]
-                test_r2 = test_corr ** 2
-                test_mae = np.mean(np.abs(y_test.values - y_pred_test))
-                
-                with st.expander("⏰ Temporal Test Performance", expanded=True):
-                    col1, col2 = st.columns(2)
-                    col1.metric("Test R²", f"{test_r2:.3f}")
-                    col2.metric("Test MAE", f"{test_mae:.3f}")
-                    
-                    # Interpretation
-                    if test_r2 > 0.3:
-                        st.success("✅ Strong predictive power on held-out seasons")
-                    elif test_r2 > 0.15:
-                        st.info("ℹ️ Moderate predictive power - model captures some signal")
-                    elif test_r2 > 0.05:
-                        st.warning("⚠️ Weak predictive power - consider adding features or data")
-                    else:
-                        st.error("❌ Very weak predictive power - model may not generalize well")
-            except Exception as e:
-                st.warning(f"Temporal validation failed: {e}")
-        
-        # PHASE 3: Cross-league transferability test
-        spfl_data = train_base[train_base["competition_id"] == 51].copy()
-        non_spfl_data = train_base[train_base["competition_id"] != 51].copy()
-        
-        if not spfl_data.empty and not non_spfl_data.empty and len(non_spfl_data) >= 25:
-            try:
-                # Split SPFL temporally
-                spfl_train, spfl_test, _ = prepare_temporal_split(spfl_data, min_train=5, min_test=3)
-                
-                if not spfl_test.empty and len(non_spfl_data) >= 25:
-                    # Train on non-SPFL temporal train
-                    non_spfl_train, _, _ = prepare_temporal_split(non_spfl_data, min_train=10, min_test=0)
-                    if non_spfl_train.empty:
-                        non_spfl_train = non_spfl_data
-                    
-                    X_nonspfl, y_nonspfl, _, _, _ = build_feature_matrix(
-                        non_spfl_train,
-                        target=PRIMARY_TARGET,
-                        include_team_controls=include_team_controls,
-                        add_age_poly=add_age_poly,
-                    )
-                    
-                    # Fit model on non-SPFL
-                    model_nonspfl = fit_elastic_net_cv(X_nonspfl, y_nonspfl, random_state=42)
-                    
-                    # Test on SPFL
-                    X_spfl_test, y_spfl_test, _, _, _ = build_feature_matrix(
-                        spfl_test,
-                        target=PRIMARY_TARGET,
-                        include_team_controls=include_team_controls,
-                        add_age_poly=add_age_poly,
-                    )
-                    # Align features
-                    for col in X_nonspfl.columns:
-                        if col not in X_spfl_test.columns:
-                            X_spfl_test[col] = 0
-                    X_spfl_test = X_spfl_test[X_nonspfl.columns]
-                    
-                    y_pred_spfl = model_nonspfl.predict(X_spfl_test.values)
-                    cross_corr = np.corrcoef(y_spfl_test.values, y_pred_spfl)[0, 1]
-                    cross_r2 = cross_corr ** 2
-                    cross_mae = np.mean(np.abs(y_spfl_test.values - y_pred_spfl))
-                    
-                    with st.expander("🌍 Cross-League Transferability"):
-                        st.markdown("**Training:** Non-SPFL leagues only")
-                        st.markdown("**Testing:** SPFL (Scottish Premiership) latest season")
-                        st.write(f"Non-SPFL training samples: {len(X_nonspfl)}")
-                        st.write(f"SPFL test samples: {len(X_spfl_test)}")
-                        
-                        col1, col2 = st.columns(2)
-                        col1.metric("Cross-league R²", f"{cross_r2:.3f}")
-                        col2.metric("Cross-league MAE", f"{cross_mae:.3f}")
-                        
-                        if cross_r2 > 0.2:
-                            st.success("✅ Model transfers reasonably well across leagues")
-                        elif cross_r2 > 0.1:
-                            st.warning("⚠️ Moderate transfer - league differences may be significant")
-                        else:
-                            st.error("❌ Poor transfer - model may be league-specific")
-            except Exception as e:
-                st.warning(f"Cross-league test failed: {e}")
     else:
         # Use cached model
         full_model = st.session_state.full_model
@@ -1270,6 +1081,181 @@ def main():
         team_feats = st.session_state.team_feats
         trait_rows = st.session_state.trait_rows
         control_rows = st.session_state.control_rows
+    
+    # ============================================
+    # PHASE 2: TEMPORAL VALIDATION
+    # ============================================
+    with st.expander("📅 Temporal Validation (Within-League)", expanded=False):
+        st.markdown("Test model on most recent season within each competition")
+        
+        if "canonical_season" not in train_base.columns or train_base["canonical_season"].isna().all():
+            st.warning("Cannot perform temporal validation: canonical_season not available")
+        else:
+            # Build temporal splits per competition
+            temporal_results = []
+            excluded_comps = []
+            
+            for comp_id in train_base["competition_id"].unique():
+                comp_data = train_base[train_base["competition_id"] == comp_id].copy()
+                comp_data = comp_data[comp_data["canonical_season"].notna()]
+                
+                if len(comp_data) == 0:
+                    continue
+                
+                max_season = comp_data["canonical_season"].max()
+                test_mask = comp_data["canonical_season"] == max_season
+                train_mask = comp_data["canonical_season"] < max_season
+                
+                test_rows = test_mask.sum()
+                train_rows = train_mask.sum()
+                
+                if train_rows < 10 or test_rows < 5:
+                    excluded_comps.append({
+                        "comp_id": comp_id,
+                        "league": LEAGUE_NAMES.get(comp_id, f"Comp {comp_id}"),
+                        "reason": f"train={train_rows}, test={test_rows} (need train>=10, test>=5)"
+                    })
+                    continue
+                
+                temporal_results.append({
+                    "comp_id": comp_id,
+                    "league": LEAGUE_NAMES.get(comp_id, f"Comp {comp_id}"),
+                    "train_rows": train_rows,
+                    "test_rows": test_rows,
+                    "test_season": int(max_season)
+                })
+            
+            if temporal_results:
+                # Build features for temporal validation
+                temp_train_list = []
+                temp_test_list = []
+                
+                for res in temporal_results:
+                    comp_data = train_base[train_base["competition_id"] == res["comp_id"]].copy()
+                    comp_data = comp_data[comp_data["canonical_season"].notna()]
+                    max_season = comp_data["canonical_season"].max()
+                    
+                    temp_train_list.append(comp_data[comp_data["canonical_season"] < max_season])
+                    temp_test_list.append(comp_data[comp_data["canonical_season"] == max_season])
+                
+                temp_train_df = pd.concat(temp_train_list, ignore_index=True)
+                temp_test_df = pd.concat(temp_test_list, ignore_index=True)
+                
+                try:
+                    X_temp_train, y_temp_train, _, _, _ = build_feature_matrix(
+                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly
+                    )
+                    X_temp_test, y_temp_test, _, _, _ = build_feature_matrix(
+                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly
+                    )
+                    
+                    # Align features
+                    common_features = list(set(X_temp_train.columns) & set(X_temp_test.columns))
+                    X_temp_train = X_temp_train[common_features]
+                    X_temp_test = X_temp_test[common_features]
+                    
+                    # Train temporal model
+                    temp_model = fit_elastic_net_cv(X_temp_train, y_temp_train, random_state=42)
+                    
+                    # Predict on test
+                    y_temp_pred = temp_model.predict(X_temp_test.values)
+                    
+                    # Metrics
+                    corr_temp = np.corrcoef(y_temp_test.values, y_temp_pred)[0, 1]
+                    r2_temp = corr_temp ** 2 if not np.isnan(corr_temp) else 0.0
+                    mae_temp = np.mean(np.abs(y_temp_test.values - y_temp_pred))
+                    
+                    st.success(f"✓ Temporal validation: R²={r2_temp:.3f}, MAE={mae_temp:.3f}")
+                    
+                    # Interpretation
+                    if r2_temp > 0.15:
+                        st.info("👍 Model shows meaningful predictive power on future seasons")
+                    elif r2_temp > 0.05:
+                        st.warning("⚠️ Model shows weak but detectable signal on future seasons")
+                    else:
+                        st.error("❌ Model shows little predictive power on future seasons")
+                    
+                    # Details table
+                    st.markdown("**Per-competition breakdown:**")
+                    temp_df = pd.DataFrame(temporal_results)
+                    st.dataframe(temp_df, width="stretch", hide_index=True)
+                    
+                    if excluded_comps:
+                        st.markdown("**Excluded competitions:**")
+                        st.dataframe(pd.DataFrame(excluded_comps), width="stretch", hide_index=True)
+                    
+                except Exception as e:
+                    st.error(f"Temporal validation failed: {e}")
+            else:
+                st.warning("No competitions met temporal validation criteria (train>=10, test>=5)")
+    
+    # ============================================
+    # PHASE 3: CROSS-LEAGUE TRANSFERABILITY
+    # ============================================
+    with st.expander("🌍 Cross-League Transferability (Train non-SPFL → Test SPFL)", expanded=False):
+        st.markdown("Test if model trained on other leagues can predict SPFL performance")
+        
+        if "competition_id" not in train_base.columns:
+            st.warning("Cannot perform cross-league test: competition_id not available")
+        elif 51 not in train_base["competition_id"].values:
+            st.warning("Cannot perform cross-league test: No SPFL data in training set")
+        else:
+            # Split data
+            non_spfl_data = train_base[train_base["competition_id"] != 51].copy()
+            spfl_data = train_base[train_base["competition_id"] == 51].copy()
+            
+            if len(non_spfl_data) < 25:
+                st.warning(f"Insufficient non-SPFL training data: {len(non_spfl_data)} rows (need >=25)")
+            elif len(spfl_data) < 10:
+                st.warning(f"Insufficient SPFL test data: {len(spfl_data)} rows (need >=10)")
+            else:
+                # Use most recent SPFL season for testing if canonical_season available
+                if "canonical_season" in spfl_data.columns and not spfl_data["canonical_season"].isna().all():
+                    max_spfl_season = spfl_data["canonical_season"].max()
+                    spfl_test = spfl_data[spfl_data["canonical_season"] == max_spfl_season].copy()
+                    if len(spfl_test) < 10:
+                        spfl_test = spfl_data  # Fallback to all SPFL data
+                else:
+                    spfl_test = spfl_data
+                
+                try:
+                    # Build feature matrices
+                    X_cross_train, y_cross_train, _, _, _ = build_feature_matrix(
+                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly
+                    )
+                    X_cross_test, y_cross_test, _, _, _ = build_feature_matrix(
+                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly
+                    )
+                    
+                    # Align features
+                    common_features = list(set(X_cross_train.columns) & set(X_cross_test.columns))
+                    X_cross_train = X_cross_train[common_features]
+                    X_cross_test = X_cross_test[common_features]
+                    
+                    # Train on non-SPFL
+                    cross_model = fit_elastic_net_cv(X_cross_train, y_cross_train, random_state=42)
+                    
+                    # Predict on SPFL
+                    y_cross_pred = cross_model.predict(X_cross_test.values)
+                    
+                    # Metrics
+                    corr_cross = np.corrcoef(y_cross_test.values, y_cross_pred)[0, 1]
+                    r2_cross = corr_cross ** 2 if not np.isnan(corr_cross) else 0.0
+                    mae_cross = np.mean(np.abs(y_cross_test.values - y_cross_pred))
+                    
+                    st.success(f"✓ Cross-league test: R²={r2_cross:.3f}, MAE={mae_cross:.3f}")
+                    st.caption(f"Train: {len(non_spfl_data)} non-SPFL rows | Test: {len(spfl_test)} SPFL rows")
+                    
+                    # Interpretation
+                    if r2_cross > 0.10:
+                        st.info("👍 Model transfers reasonably to SPFL from other leagues")
+                    elif r2_cross > 0.03:
+                        st.warning("⚠️ Model shows weak transferability to SPFL")
+                    else:
+                        st.error("❌ Model does not transfer well to SPFL from other leagues")
+                    
+                except Exception as e:
+                    st.error(f"Cross-league test failed: {e}")
     
     enet = full_model.named_steps["enet"]
     st.caption(
@@ -1442,15 +1428,20 @@ def main():
     preds = full_model.predict(scout_X.values)
     scouting = scouting.copy()
     scouting["pred_np_xg_90"] = preds
-    scouting["pred_goals_90_assuming_avg_finish"] = preds * 1.0  # League-average finishing assumption
+    scouting["pred_goals_90_avg_finish"] = preds * 1.0  # Assumes league-average finishing
     
-    # Calculate residuals - but set to NaN for players from leagues not in training
-    train_comps = st.session_state.get("train_competitions", [])
-    scouting["residual"] = scouting[PRIMARY_TARGET].astype(float) - scouting["pred_np_xg_90"]
-    if train_comps:
-        # Set residuals to NaN for players from leagues not used in training
-        out_of_training_mask = ~scouting["competition_id"].isin(train_comps)
-        scouting.loc[out_of_training_mask, "residual"] = np.nan
+    # Compute residuals, but set to NaN for players outside training competitions
+    # to avoid misleading residual-based rankings
+    if "competition_id" in scouting.columns:
+        training_comp_ids = set(train_base["competition_id"].unique()) if "competition_id" in train_base.columns else set()
+        in_training_comps = scouting["competition_id"].isin(training_comp_ids)
+        scouting["residual"] = np.where(
+            in_training_comps,
+            scouting[PRIMARY_TARGET].astype(float) - scouting["pred_np_xg_90"],
+            np.nan
+        )
+    else:
+        scouting["residual"] = scouting[PRIMARY_TARGET].astype(float) - scouting["pred_np_xg_90"]
     
     # Residual diagnostics for scouting pool
     residuals_scout = scouting["residual"].dropna()
@@ -1484,16 +1475,16 @@ def main():
     # Display
     show_cols = [c for c in [
         "player_name", "age", "primary_position", "team_name", "league_name", "season_name",
-        "minutes", PRIMARY_TARGET, "pred_np_xg_90", "pred_goals_90_assuming_avg_finish", "residual"
+        "minutes", PRIMARY_TARGET, "pred_np_xg_90", "pred_goals_90_avg_finish", "residual"
     ] if c in scouting.columns]
+    
+    # Warning for residual sort
+    if sort_by == "residual":
+        st.warning("⚠️ Residual-based ranking: Only valid for players from training competitions. Others shown as NaN.")
 
     # Sort by user selection
-    if sort_by == "residual":
-        st.warning("⚠️ Residual sorting: players from leagues not used in training have residual=NaN and will be excluded from ranking.")
-        scouting_sorted = scouting[scouting["residual"].notna()].sort_values(sort_by, ascending=False)
-    else:
-        sort_ascending = False
-        scouting_sorted = scouting.sort_values(sort_by, ascending=sort_ascending)
+    sort_ascending = sort_by == "residual"  # residual can be positive or negative
+    scouting_sorted = scouting.sort_values(sort_by, ascending=sort_ascending, na_position='last')
     
     # rank by selected metric (1 = best)
     topn = st.slider("Shortlist size", 10, 100, 30, 5)
@@ -1504,17 +1495,15 @@ def main():
     show_cols_with_rank = ["rank"] + show_cols if "rank" in shortlist.columns else show_cols
     
     # Formatting
-    for col in ["pred_np_xg_90", "pred_goals_90_assuming_avg_finish", PRIMARY_TARGET, "residual"]:
+    for col in ["pred_np_xg_90", "pred_goals_90_avg_finish", PRIMARY_TARGET, "residual"]:
         if col in shortlist.columns:
             shortlist[col] = shortlist[col].astype(float).round(3)
 
     st.dataframe(shortlist[show_cols_with_rank], width="stretch", hide_index=True)
 
     st.caption(
-        "Tip: Residual > 0 = producing more np_xg than the model expects given traits + team context. "
-        "Residual < 0 = underproducing vs expected. "
-        "pred_goals_90_assuming_avg_finish assumes league-average finishing (1.0x conversion rate). "
-        "Residuals are NaN for players from leagues not used in training."
+        "Tip: Residual > 0 = producing more np_xg than the model expects given traits + team context (could be role/system quirks). "
+        "Residual < 0 = underproducing vs traits/context (possible buy-low or role mismatch)."
     )
 
     with st.expander("Download shortlist as CSV"):
@@ -1541,7 +1530,7 @@ def main():
             r = row.iloc[0]
             st.markdown(f"**{r.get('player_name','')}** — {r.get('team_name','')} ({r.get('league_name','')}, {r.get('season_name','')})")
             st.write(f"Minutes: **{int(r.get('minutes',0))}** | Age: **{int(r.get('age',0))}**")
-            st.write(f"Rank: **#{int(r.get('rank',0))}** | Actual {PRIMARY_TARGET}: **{r.get(PRIMARY_TARGET, np.nan):.3f}** | Predicted np_xG/90: **{r.get('pred_np_xg_90', np.nan):.3f}** | Predicted goals/90 (avg finish): **{r.get('pred_goals_90_assuming_avg_finish', np.nan):.3f}**")
+            st.write(f"Rank: **#{int(r.get('rank',0))}** | Actual {PRIMARY_TARGET}: **{r.get(PRIMARY_TARGET, np.nan):.3f}** | Predicted np_xG/90: **{r.get('pred_np_xg_90', np.nan):.3f}**")
 
             # Show z-scores within the *scouting pool* for interpretability (using cached stats)
             score_df = []
