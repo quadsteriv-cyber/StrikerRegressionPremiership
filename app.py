@@ -535,6 +535,7 @@ def build_feature_matrix(
     include_team_controls: bool = True,
     add_age_poly: bool = True,
     enable_league_fixed_effects: bool = False,
+    behaviour_only: bool = True,
     allow_xg_identity: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series, List[str], List[str], Dict]:
     """
@@ -557,44 +558,112 @@ def build_feature_matrix(
         "canonical_season",
     }
 
-    # PHASE 2: Enhanced leak / tautology bans (anything too close to outcome)
-    # We are modelling np_xg_90, so bans include np_xg itself (target), and goal/finishing variables.
-    bans = {
+    # ============================================
+    # BEHAVIOUR-ONLY GUARDRAILS
+    # ============================================
+    
+    # HARD EXCLUSIONS (ALWAYS applied, regardless of toggles)
+    hard_exclusion_patterns = [
+        "xg", "npxg", "np_xg", "xg_per", "xg_90",
+        "conversion", "shot_conversion",
+        "goals", "goal", "npg", "npgoals",
+        "assist", "assists", "xa",
+        "npga", "goals_against", "ga", "conceded",
+    ]
+    
+    hard_bans = {
         target,
-        # Target aliases (ALWAYS banned)
+        # Target aliases
         "np_xg", "npxg", "np_xg_per_90", "npxg_90",
-        # Goal outcomes / finishing / conversion
-        "goals_90", "npg_90", "goals", "npg",
+        # Goal outcomes / finishing
+        "goals_90", "npg_90", "goals", "npg", "npgoals",
         "conversion_ratio", "shot_on_target_ratio", "shot_conversion",
         "over_under_performance_90", "penalty_goals_90",
         "penalty_conversion_ratio",
+        # Assists
+        "assists", "xa", "xA", "expected_assists",
+        # Goals against / defensive outcomes
+        "npga", "npga_90", "goals_against", "ga", "conceded",
         # Minutes (hard leakage)
         "minutes", "player_season_minutes",
-        # direct derived combos (if present)
+        # Other outcome proxies
         "shots_faced_90", "save_ratio",
     }
-
-    # PHASE 1: xG-identity exclusion (unless explicitly allowed)
-    xg_identity_patterns = ["xg", "npxg", "np_xg", "xg_per", "shots_90", "shots_pg", "xg_90"]
     
-    def is_xg_identity(col_name: str) -> bool:
-        """Check if column name matches xG-identity patterns."""
+    def contains_hard_exclusion(col_name: str) -> bool:
+        """Check if column contains any hard exclusion pattern."""
         col_lower = col_name.lower()
-        return any(pattern in col_lower for pattern in xg_identity_patterns)
-
-    # Numeric columns
+        return any(pattern in col_lower for pattern in hard_exclusion_patterns)
+    
+    # BEHAVIOUR-ONLY WHITELIST
+    allowed_player_behaviours = [
+        "touch", "touches_inside_box", "box_touch",
+        "shot_touch_ratio",
+        "shots_", "np_shots",  # shot COUNTS, not xG per shot
+        "press", "pressure", "counterpress",
+        "carry", "dribble",
+        "receive", "receptions", "received",
+        "pass", "key_pass", "passes_inside_box",
+        "aerial", "duel",
+        "foul_won", "turnover",
+        "distance", "average_x_pass",
+        "obv",  # on-ball value (not outcome-derived)
+    ]
+    
+    allowed_team_patterns = [
+        "team_possession", "team_directness",
+        "team_passes_inside_box", "team_crosses_into_box",
+        "team_deep_completions", "team_field_tilt",
+        "team_",  # generic team context
+        "league_",  # league fixed effects
+    ]
+    
+    def is_allowed_behaviour(col_name: str) -> bool:
+        """Check if column matches allowed behaviour patterns."""
+        col_lower = col_name.lower()
+        # Check player behaviours
+        if any(pattern in col_lower for pattern in allowed_player_behaviours):
+            return True
+        # Check team patterns
+        if any(col_lower.startswith(pattern.lower()) or pattern.lower() in col_lower 
+               for pattern in allowed_team_patterns):
+            return True
+        return False
+    
+    # Get all numeric columns
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    player_num = [c for c in num_cols if (c not in non_feature_cols) and (not c.startswith("team_")) and (c not in bans)]
-
-    # Apply xG-identity filter if disabled
-    if not allow_xg_identity:
-        player_num = [c for c in player_num if not is_xg_identity(c)]
-
-    team_cols = get_team_control_columns(df) if include_team_controls else []
-    # Also filter team controls for xG-identity
-    if not allow_xg_identity:
-        team_cols = [c for c in team_cols if not is_xg_identity(c)]
-
+    
+    # Initial filtering: remove non-feature cols and hard bans
+    candidate_cols = [c for c in num_cols 
+                     if (c not in non_feature_cols) 
+                     and (c not in hard_bans)
+                     and (not contains_hard_exclusion(c))]
+    
+    # Separate player and team columns
+    player_candidates = [c for c in candidate_cols if not c.startswith("team_") and not c.startswith("league_")]
+    team_candidates = [c for c in candidate_cols if c.startswith("team_") or c.startswith("league_")]
+    
+    # Apply behaviour-only filter if enabled
+    dropped_by_behaviour_filter = []
+    if behaviour_only:
+        player_num = [c for c in player_candidates if is_allowed_behaviour(c)]
+        dropped_by_behaviour_filter = [c for c in player_candidates if not is_allowed_behaviour(c)]
+        
+        # Team controls: keep if allowed OR if include_team_controls
+        if include_team_controls:
+            team_cols = team_candidates  # Keep all team controls
+        else:
+            team_cols = []
+    else:
+        player_num = player_candidates
+        team_cols = team_candidates if include_team_controls else []
+    
+    # Track filtering stats
+    total_numeric = len(num_cols)
+    after_hard_exclusions = len(candidate_cols)
+    after_behaviour_filter = len(player_num) + len(team_cols)
+    
+    # Build initial X
     X = df[player_num + team_cols].copy()
 
     # Age controls
@@ -639,13 +708,22 @@ def build_feature_matrix(
             X[c] = X[c].fillna(X[c].median())
     
     # ============================================
-    # LEAKAGE DIAGNOSTICS
+    # LEAKAGE DIAGNOSTICS & CORRELATION-BASED GUARDRAIL
     # ============================================
     leakage_diagnostics = {
         "correlations": {},
         "exact_matches": [],
+        "dropped_high_corr": [],
         "dropped_features": [],
-        "leaky_features": []
+        "leaky_features": [],
+        "guardrail_stats": {
+            "total_numeric": total_numeric,
+            "after_hard_exclusions": after_hard_exclusions,
+            "after_behaviour_filter": after_behaviour_filter,
+            "final_feature_count": 0,  # Will update after drops
+        },
+        "dropped_by_behaviour": dropped_by_behaviour_filter[:50],  # First 50
+        "kept_features": list(X.columns)[:50],  # Will update after drops
     }
     
     # Compute correlation of each feature with target
@@ -670,22 +748,18 @@ def build_feature_matrix(
         except Exception:
             pass
     
-    # Identify highly correlated features (suspicious)
+    # Identify highly correlated features (>0.95) - ALWAYS drop these
     corr_series = pd.Series(correlations)
-    leaky_features = corr_series[corr_series.abs() > 0.95].index.tolist()
-    
-    # PHASE 0: Track xG-derived features for diagnostics
-    xg_derived = [c for c in X.columns if is_xg_identity(c)]
+    high_corr_features = corr_series[corr_series.abs() > 0.95].index.tolist()
     
     # Store diagnostics
     leakage_diagnostics["correlations"] = correlations
     leakage_diagnostics["exact_matches"] = exact_matches
-    leakage_diagnostics["leaky_features"] = leaky_features
-    leakage_diagnostics["xg_derived_features"] = xg_derived
-    leakage_diagnostics["xg_derived_count"] = len(xg_derived)
+    leakage_diagnostics["leaky_features"] = high_corr_features
+    leakage_diagnostics["dropped_high_corr"] = high_corr_features
     
-    # Determine which columns to drop (PHASE 2: auto-drop high correlation)
-    drop_cols = set(exact_matches) | set(leaky_features)
+    # Determine which columns to drop
+    drop_cols = set(exact_matches) | set(high_corr_features)
     
     if drop_cols:
         leakage_diagnostics["dropped_features"] = list(drop_cols)
@@ -697,6 +771,10 @@ def build_feature_matrix(
         team_features = [f for f in team_features if f not in drop_cols]
     else:
         leakage_diagnostics["dropped_features"] = []
+    
+    # Update final stats
+    leakage_diagnostics["guardrail_stats"]["final_feature_count"] = len(X.columns)
+    leakage_diagnostics["kept_features"] = list(X.columns)[:50]  # First 50 kept
 
     return X, y, player_features, team_features, leakage_diagnostics
 
@@ -815,10 +893,16 @@ def main():
         add_age_poly = st.checkbox("Use age + age² (recommended)", value=True)
         
         st.divider()
+        behaviour_only = st.checkbox("✅ Behaviour-only features (recommended)",
+                                    value=True,
+                                    help="Strict whitelist: only upstream player actions (touches, receptions, carries, pressures, aerials, etc.) + team context")
+        
         allow_xg_identity = st.checkbox("⚠️ Allow xG-derived predictors (identity risk)",
                                        value=False,
                                        help="When OFF: excludes xG, npxg, shots_90, etc. Model uses only upstream behaviours.")
-        if not allow_xg_identity:
+        if not behaviour_only:
+            st.warning("⚠️ Behaviour-only filter is OFF - model may use outcome-contaminated features")
+        elif not allow_xg_identity:
             st.caption("🛡️ Model restricted to upstream behavioural features (touches, receptions, carries, pressures, aerials, etc.)")
 
         n_boot = st.slider("Stability selection bootstraps", 30, 300, 120, 10)
@@ -845,7 +929,7 @@ def main():
         load_btn = st.button("Load / Refresh Data", type="primary")
 
     # Check if model settings changed (requires refit)
-    model_settings_key = f"{include_team_controls}_{add_age_poly}_{enable_league_fe}_{allow_xg_identity}_{n_boot}_{sample_frac}"
+    model_settings_key = f"{include_team_controls}_{add_age_poly}_{enable_league_fe}_{behaviour_only}_{allow_xg_identity}_{n_boot}_{sample_frac}"
     model_settings_changed = st.session_state.get("model_settings_key") != model_settings_key
     
     # Persist data in session state
@@ -1013,6 +1097,7 @@ def main():
                 include_team_controls=include_team_controls,
                 add_age_poly=add_age_poly,
                 enable_league_fixed_effects=enable_league_fe,
+                behaviour_only=behaviour_only,
                 allow_xg_identity=allow_xg_identity,
             )
         except Exception as e:
@@ -1161,6 +1246,49 @@ def main():
         leakage_diag = st.session_state.leakage_diag
     
     # ============================================
+    # FEATURE GUARDRAIL REPORT
+    # ============================================
+    with st.expander("🛡️ Feature Guardrail Report", expanded=behaviour_only):
+        st.markdown("**Purpose**: Show how behaviour-only filtering and hard exclusions protect against outcome leakage")
+        
+        guardrail_stats = leakage_diag.get("guardrail_stats", {})
+        
+        # Counts
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total numeric cols", guardrail_stats.get("total_numeric", 0))
+        with col2:
+            st.metric("After hard exclusions", guardrail_stats.get("after_hard_exclusions", 0))
+        with col3:
+            st.metric("After behaviour filter", guardrail_stats.get("after_behaviour_filter", 0))
+        with col4:
+            st.metric("Final (post-corr drop)", guardrail_stats.get("final_feature_count", 0))
+        
+        # Dropped by behaviour filter
+        dropped_by_behaviour = leakage_diag.get("dropped_by_behaviour", [])
+        if dropped_by_behaviour and behaviour_only:
+            st.subheader("🚫 Dropped by behaviour-only filter")
+            st.caption(f"Showing first {len(dropped_by_behaviour)} of dropped features")
+            st.write(dropped_by_behaviour)
+        
+        # Dropped by correlation
+        dropped_high_corr = leakage_diag.get("dropped_high_corr", [])
+        if dropped_high_corr:
+            st.subheader("⚠️ Dropped due to high correlation (|r| > 0.95)")
+            st.write(dropped_high_corr)
+        
+        # Kept features
+        kept_features = leakage_diag.get("kept_features", [])
+        if kept_features:
+            st.subheader("✅ Kept features (first 50)")
+            st.write(kept_features)
+        
+        if behaviour_only:
+            st.success("✓ Behaviour-only filter is ACTIVE - only upstream player actions + team context allowed")
+        else:
+            st.warning("⚠️ Behaviour-only filter is OFF - may include outcome-contaminated features")
+    
+    # ============================================
     # PHASE 0: TAUTOLOGY DIAGNOSTICS
     # ============================================
     with st.expander("🧮 Tautology Diagnostics (Is target reconstructible?)", expanded=False):
@@ -1180,63 +1308,42 @@ def main():
                 "abs_coef": np.abs(coefs)
             }).sort_values("abs_coef", ascending=False).head(20)
             st.dataframe(coef_df, width=700, hide_index=True)
+            
+            # Check for outcome-contaminated features in top coefficients
+            outcome_patterns = ["goals", "npg", "assists", "xa", "npga", "conversion"]
+            top_features = coef_df["feature"].head(20).tolist()
+            contaminated = [f for f in top_features 
+                          if any(pattern in f.lower() for pattern in outcome_patterns)]
+            if contaminated:
+                st.error(f"⚠️ Outcome-contaminated features in top coefficients: {contaminated}")
+            else:
+                st.success("✓ No obvious outcome features in top coefficients")
         except Exception as e:
             st.error(f"Could not extract coefficients: {e}")
         
-        # 2) xG-DERIVED FEATURE AUDIT
-        st.subheader("2️⃣ xG-Derived Feature Audit")
-        xg_derived = leakage_diag.get("xg_derived_features", [])
-        xg_count = leakage_diag.get("xg_derived_count", 0)
-        st.metric("xG-derived features in X", xg_count)
-        if xg_derived:
-            st.write("Features matching xG-identity patterns:")
-            st.write(xg_derived[:30])  # Show up to 30
-            if not allow_xg_identity:
-                st.info("✓ xG-identity filter is ENABLED - these features were excluded during training")
+        # 2) CORRELATION-BASED LEAKAGE CHECK
+        st.subheader("2️⃣ Correlation-Based Leakage Check")
+        high_corr = leakage_diag.get("dropped_high_corr", [])
+        if high_corr:
+            st.error(f"⚠️ {len(high_corr)} features auto-dropped for |correlation| > 0.95")
+            st.write(high_corr[:30])
         else:
-            st.success("✓ No xG-derived features found in feature matrix")
+            st.success("✓ No features with suspicious correlation (>0.95) to target")
         
         # 3) IDENTITY RECONSTRUCTION TEST
-        st.subheader("3️⃣ Identity Reconstruction Test")
-        if xg_derived and allow_xg_identity:
-            try:
-                from sklearn.linear_model import Ridge
-                # Get xG features present in X
-                xg_in_X = [f for f in xg_derived if f in X.columns]
-                if len(xg_in_X) > 0:
-                    X_xg_only = X[xg_in_X].copy()
-                    # Fit simple model on xG features only
-                    ridge_xg = Ridge(alpha=1.0)
-                    ridge_xg.fit(X_xg_only.values, y.values)
-                    y_pred_xg = ridge_xg.predict(X_xg_only.values)
-                    resid_xg = y.values - y_pred_xg
-                    resid_xg_std = float(np.std(resid_xg, ddof=1))
-                    
-                    # Compare to main model
-                    y_pred_main = full_model.predict(X.values)
-                    resid_main = y.values - y_pred_main
-                    resid_main_std = float(np.std(resid_main, ddof=1))
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Residual std (xG features only)", f"{resid_xg_std:.6f}")
-                    with col2:
-                        st.metric("Residual std (main model)", f"{resid_main_std:.6f}")
-                    
-                    if resid_xg_std < 0.01:
-                        st.error("⚠️ xG-only model has tiny residuals! Target is reconstructible from xG components.")
-                    elif resid_main_std < resid_xg_std * 1.2:
-                        st.warning("⚠️ Main model residuals similar to xG-only - possible identity leakage")
-                    else:
-                        st.success("✓ Main model performs differently than xG-only reconstruction")
-                else:
-                    st.info("No xG-derived features present in training matrix")
-            except Exception as e:
-                st.error(f"Reconstruction test failed: {e}")
-        elif not allow_xg_identity:
-            st.success("✓ xG-identity filter is enabled - reconstruction test not needed")
+        st.subheader("3️⃣ Residual Variance Check")
+        residuals_train = y.values - full_model.predict(X.values)
+        resid_std = float(np.std(residuals_train, ddof=1))
+        st.metric("Training residual std", f"{resid_std:.6f}")
+        
+        if resid_std < 0.001:
+            st.error("🚨 CRITICAL: Residual std < 0.001 - model is reconstructing target!")
+        elif resid_std < 0.01:
+            st.warning("⚠️ Very small residual std - possible identity leakage")
+        elif resid_std < 0.05:
+            st.info("ℹ️ Small but non-trivial residual variance")
         else:
-            st.info("No xG-derived features to test")
+            st.success(f"✓ Healthy residual variance - model uses upstream behaviours")
     
     # ============================================
     # PHASE 2: TEMPORAL VALIDATION
@@ -1299,10 +1406,10 @@ def main():
                 
                 try:
                     X_temp_train, y_temp_train, _, _, _ = build_feature_matrix(
-                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
+                        temp_train_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
                     )
                     X_temp_test, y_temp_test, _, _, _ = build_feature_matrix(
-                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
+                        temp_test_df, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
                     )
                     
                     # Align features
@@ -1377,10 +1484,10 @@ def main():
                 try:
                     # Build feature matrices
                     X_cross_train, y_cross_train, _, _, _ = build_feature_matrix(
-                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
+                        non_spfl_data, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
                     )
                     X_cross_test, y_cross_test, _, _, _ = build_feature_matrix(
-                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, allow_xg_identity
+                        spfl_test, PRIMARY_TARGET, include_team_controls, add_age_poly, enable_league_fe, behaviour_only, allow_xg_identity
                     )
                     
                     # Align features
